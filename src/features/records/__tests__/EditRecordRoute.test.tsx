@@ -1,7 +1,7 @@
 import { act, fireEvent, render, waitFor } from '@testing-library/react-native';
 
 import EditRecordRoute from '../../../../app/record/edit/[id]';
-import type { RecordRepository } from '../../../data/repositories';
+import type { RecordRepository, RecordTransaction } from '../../../data/repositories';
 import type { NewRecordInput, TimelineRecord } from '../../../domain/types';
 import { RecordRepositoryProvider } from '../RecordRepositoryProvider';
 import { MemoryRecordRepository } from '../../../test/memoryRepositories';
@@ -118,13 +118,18 @@ function createRepository(
   }),
 ): RecordRepository {
   const memory = new MemoryRecordRepository();
+  const transaction: RecordTransaction = {
+    create: (input) => memory.create(input),
+    update,
+    delete: (id) => memory.delete(id),
+  };
   return {
     create: (input) => memory.create(input),
     update,
     delete: (id) => memory.delete(id),
     get,
     list: (filter) => memory.list(filter),
-    withTransaction: (work) => memory.withTransaction(work),
+    withTransaction: (work) => work(transaction),
   };
 }
 

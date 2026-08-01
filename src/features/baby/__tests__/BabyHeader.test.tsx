@@ -1,4 +1,4 @@
-import { render } from '@testing-library/react-native';
+import { fireEvent, render } from '@testing-library/react-native';
 
 import type { Baby } from '../../../domain/types';
 import BabyHeader from '../BabyHeader';
@@ -20,4 +20,17 @@ test('shows the baby name and age calculated from the supplied current date', as
 
   expect(view.getByText('安安')).toBeTruthy();
   expect(view.getByText('1岁1个月')).toBeTruthy();
+});
+
+test('falls back to the baby initial when an avatar file cannot load', async () => {
+  const view = await render(
+    <BabyHeader
+      baby={{ ...baby, avatarPath: 'file:///documents/media/missing.jpg' }}
+      now={new Date(2026, 7, 1, 12)}
+    />,
+  );
+
+  await fireEvent(view.getByLabelText('宝宝头像'), 'error');
+
+  expect(view.getByText('安')).toBeTruthy();
 });

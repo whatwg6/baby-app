@@ -5,6 +5,7 @@ import { Stack } from 'expo-router';
 import { createDatabaseManager } from '../src/data/database';
 import { createSQLiteRepositories, type SQLiteRepositories } from '../src/data/repositories';
 import { BabyRepositoryProvider } from '../src/features/baby/useBaby';
+import { mediaService, removeUnreferencedMedia } from '../src/features/media/mediaService';
 import { RecordRepositoryProvider } from '../src/features/records/RecordRepositoryProvider';
 import { colors, spacing } from '../src/ui/theme';
 
@@ -20,9 +21,18 @@ export default function RootLayout() {
 
     void createDatabaseManager()
       .initialize()
-      .then((database) => {
+      .then(async (database) => {
+        const initialized = createSQLiteRepositories(database);
+        await removeUnreferencedMedia({
+          babies: initialized.babies,
+          records: initialized.records,
+          media: mediaService,
+        });
+        return initialized;
+      })
+      .then((initialized) => {
         if (active) {
-          setRepositories(createSQLiteRepositories(database));
+          setRepositories(initialized);
         }
       })
       .catch(() => {

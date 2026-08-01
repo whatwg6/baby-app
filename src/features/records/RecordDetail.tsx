@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Image, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import type { RecordRepository } from '../../data/repositories';
-import type { ActivityDetails, Attachment, GrowthDetails, MilestoneDetails, TimelineRecord } from '../../domain/types';
+import type { ActivityDetails, GrowthDetails, MilestoneDetails, TimelineRecord } from '../../domain/types';
 import { colors, radius, spacing } from '../../ui/theme';
+import { MediaPreview } from '../media/MediaPreview';
 import { recordTypeLabel } from '../timeline/TimelineCard';
 
 const loadErrorMessage = '无法读取记录，请重试';
@@ -67,7 +68,12 @@ export function RecordDetail({
       {record.note?.trim() ? <Text style={styles.note}>{record.note}</Text> : null}
       <View style={styles.attachments}>
         {record.attachments.map((attachment) => (
-          <MediaPreview key={attachment.id} attachment={attachment} />
+          <MediaPreview
+            accessibilityLabel="记录媒体"
+            key={attachment.id}
+            mediaType={attachment.mediaType}
+            uri={attachment.thumbnailPath ?? attachment.filePath}
+          />
         ))}
       </View>
       <View style={styles.actions}>
@@ -132,36 +138,6 @@ function RecordDetails({ record }: { record: TimelineRecord }) {
   }
 }
 
-function MediaPreview({ attachment }: { attachment: Attachment }) {
-  const uri = attachment.thumbnailPath || attachment.filePath;
-  const [unavailable, setUnavailable] = useState(uri.trim().length === 0);
-
-  if (unavailable) {
-    return (
-      <View accessibilityLabel="媒体文件不可用" style={styles.mediaPlaceholder}>
-        <Text style={styles.mediaPlaceholderText}>媒体文件不可用</Text>
-      </View>
-    );
-  }
-
-  if (attachment.mediaType === 'video') {
-    return (
-      <View accessibilityLabel="视频媒体" style={styles.mediaPlaceholder}>
-        <Text style={styles.mediaPlaceholderText}>视频媒体</Text>
-      </View>
-    );
-  }
-
-  return (
-    <Image
-      accessibilityLabel="记录媒体"
-      onError={() => setUnavailable(true)}
-      source={{ uri }}
-      style={styles.image}
-    />
-  );
-}
-
 function activityLabel(type: ActivityDetails['activityType']): string {
   switch (type) {
     case 'feeding':
@@ -195,17 +171,6 @@ const styles = StyleSheet.create({
   details: { gap: spacing.sm },
   note: { color: colors.text, fontSize: 16, lineHeight: 24 },
   attachments: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
-  image: { borderRadius: radius.sm, height: 120, width: 120 },
-  mediaPlaceholder: {
-    alignItems: 'center',
-    backgroundColor: colors.card,
-    borderRadius: radius.sm,
-    height: 120,
-    justifyContent: 'center',
-    padding: spacing.sm,
-    width: 120,
-  },
-  mediaPlaceholderText: { color: colors.muted, fontSize: 14, textAlign: 'center' },
   actions: { flexDirection: 'row', gap: spacing.sm, marginTop: spacing.md },
   editAction: { backgroundColor: colors.accent, borderRadius: radius.md, padding: spacing.md },
   editActionText: { color: colors.card, fontSize: 16, fontWeight: '700' },

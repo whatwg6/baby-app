@@ -1,17 +1,25 @@
 import { useEffect, useRef, useState } from 'react';
 import { StyleSheet, Text, TextInput, View } from 'react-native';
 
-import type { MilestoneDetails } from '../../../domain/types';
+import type { MilestoneDetails, RecordDraftAttachment } from '../../../domain/types';
 import { colors, radius, spacing } from '../../../ui/theme';
+import { MediaPicker } from '../../media/MediaPicker';
+import { MediaPreview } from '../../media/MediaPreview';
 
 export function MilestoneFields({
   initialValue,
+  attachments,
   resetKey,
   onChange,
+  onAdd,
+  onRemove,
 }: {
   initialValue: MilestoneDetails;
+  attachments: RecordDraftAttachment[];
   resetKey: string;
   onChange(details: MilestoneDetails): void;
+  onAdd(attachment: Extract<RecordDraftAttachment, { kind: 'picked' }>): void;
+  onRemove(index: number): void;
 }) {
   const [value, setValue] = useState(() => toFormValue(initialValue));
   const valueRef = useRef(value);
@@ -59,6 +67,19 @@ export function MilestoneFields({
           value={value.presetKey}
         />
       </View>
+      <MediaPicker allowedMedia={['image']} onPick={onAdd} />
+      <View style={styles.previews}>
+        {attachments.map((attachment, index) => (
+          <MediaPreview
+            key={`${attachment.kind}:${attachment.kind === 'picked' ? attachment.sourceUri : attachment.id}:${index}`}
+            mediaType={attachment.mediaType}
+            onRemove={() => onRemove(index)}
+            uri={attachment.kind === 'picked'
+              ? attachment.sourceUri
+              : attachment.thumbnailPath ?? attachment.filePath}
+          />
+        ))}
+      </View>
     </View>
   );
 }
@@ -82,4 +103,5 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.md,
     paddingVertical: 12,
   },
+  previews: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
 });

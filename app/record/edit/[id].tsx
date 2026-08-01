@@ -4,7 +4,8 @@ import { useLocalSearchParams, useRouter, type Href } from 'expo-router';
 
 import type { RecordRepository } from '../../../src/data/repositories';
 import type { RecordDraft, TimelineRecord } from '../../../src/domain/types';
-import { RecordEditor, toNewRecordInput } from '../../../src/features/records/RecordEditor';
+import { mediaService, updateRecordWithMedia } from '../../../src/features/media/mediaService';
+import { RecordEditor } from '../../../src/features/records/RecordEditor';
 import { useRecordRepository } from '../../../src/features/records/RecordRepositoryProvider';
 import { colors, spacing } from '../../../src/ui/theme';
 
@@ -85,7 +86,10 @@ export default function EditRecordRoute() {
     <RecordEditor
       initialValue={toRecordDraft(record)}
       onSubmit={async (draft) => {
-        await repository.update(recordId, toNewRecordInput(draft));
+        await updateRecordWithMedia(recordId, draft, {
+          records: repository,
+          media: mediaService,
+        });
         router.replace(`/record/${recordId}` as Href);
       }}
       type={record.type}

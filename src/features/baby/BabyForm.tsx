@@ -10,11 +10,16 @@ import {
 import { parseBabyInput } from '../../domain/validation';
 import type { BabyInput } from '../../domain/types';
 import { colors, radius, spacing } from '../../ui/theme';
+import { MediaPicker } from '../media/MediaPicker';
+import { MediaPreview } from '../media/MediaPreview';
+import { MediaServiceError } from '../media/mediaService';
+
+export type PickedAvatar = { sourceUri: string };
 
 type BabyFormProps = {
   initialValue?: BabyInput;
   now?: Date;
-  onSave: (input: BabyInput) => void | Promise<unknown>;
+  onSave: (input: BabyInput, pickedAvatar?: PickedAvatar) => void | Promise<unknown>;
 };
 
 type FormValue = {
@@ -77,10 +82,12 @@ export default function BabyForm({ initialValue, now = new Date(), onSave }: Bab
   const [value, setValue] = useState(() => toFormValue(initialValue));
   const [errors, setErrors] = useState<FormErrors>({});
   const [saving, setSaving] = useState(false);
+  const [pickedAvatar, setPickedAvatar] = useState<PickedAvatar | null>(null);
 
   useEffect(() => {
     if (initialValue !== undefined) {
       setValue(toFormValue(initialValue));
+      setPickedAvatar(null);
       setErrors({});
     }
   }, [initialValue]);
@@ -102,15 +109,16 @@ export default function BabyForm({ initialValue, now = new Date(), onSave }: Bab
     setSaving(true);
     setErrors({});
     try {
-      void Promise.resolve(onSave(input))
-        .catch(() => {
-          setErrors({ save: '保存失败，请稍后重试' });
+      const result = pickedAvatar === null ? onSave(input) : onSave(input, pickedAvatar);
+      void Promise.resolve(result)
+        .catch((reason: unknown) => {
+          setErrors({ save: saveErrorMessage(reason) });
         })
         .finally(() => {
           setSaving(false);
         });
-    } catch {
-      setErrors({ save: '保存失败，请稍后重试' });
+    } catch (reason) {
+      setErrors({ save: saveErrorMessage(reason) });
       setSaving(false);
     }
   };
@@ -166,16 +174,25 @@ export default function BabyForm({ initialValue, now = new Date(), onSave }: Bab
         </View>
       </View>
 
-      <View>
-        <Text style={styles.label}>头像路径（可选）</Text>
-        <TextInput
-          accessibilityLabel="头像路径（可选）"
-          autoCapitalize="none"
-          onChangeText={(avatarPath) => setValue((current) => ({ ...current, avatarPath }))}
-          placeholder="稍后可从相册选择"
-          style={styles.input}
-          value={value.avatarPath}
+      <View style={styles.avatarField}>
+        <Text style={styles.label}>头像（可选）</Text>
+        <MediaPicker
+          allowedMedia={['image']}
+          onPick={(attachment) => {
+            setPickedAvatar({ sourceUri: attachment.sourceUri });
+            setValue((current) => ({ ...current, avatarPath: attachment.sourceUri }));
+          }}
         />
+        {value.avatarPath === '' ? null : (
+          <MediaPreview
+            mediaType="image"
+            onRemove={() => {
+              setPickedAvatar(null);
+              setValue((current) => ({ ...current, avatarPath: '' }));
+            }}
+            uri={value.avatarPath}
+          />
+        )}
       </View>
 
       {errors.save === undefined ? null : <Text style={styles.error}>{errors.save}</Text>}
@@ -189,6 +206,10 @@ export default function BabyForm({ initialValue, now = new Date(), onSave }: Bab
       </Pressable>
     </View>
   );
+}
+
+function saveErrorMessage(reason: unknown): string {
+  return reason instanceof MediaServiceError ? reason.message : '保存失败，请稍后重试';
 }
 
 const styles = StyleSheet.create({
@@ -205,6 +226,7 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
   },
   error: { color: colors.danger, fontSize: 13, marginTop: spacing.xs },
+  avatarField: { alignItems: 'flex-start', gap: spacing.sm },
   sexOptions: { flexDirection: 'row', gap: spacing.sm },
   sexOption: {
     borderColor: colors.border,

@@ -13,6 +13,7 @@ import type {
 } from '../../domain/types';
 import { parseRecordDraft } from '../../domain/validation';
 import { colors, radius, spacing } from '../../ui/theme';
+import { MediaServiceError } from '../media/mediaService';
 import { ActivityFields, type EditableActivityDetails } from './forms/ActivityFields';
 import { GrowthFields } from './forms/GrowthFields';
 import { MilestoneFields } from './forms/MilestoneFields';
@@ -93,8 +94,12 @@ export function RecordEditor({
     setErrors({});
     try {
       await onSubmit(input);
-    } catch {
-      setErrors({ save: '保存失败，已有数据未受影响' });
+    } catch (reason) {
+      setErrors({
+        save: reason instanceof MediaServiceError
+          ? reason.message
+          : '保存失败，已有数据未受影响',
+      });
     } finally {
       savingRef.current = false;
       setSaving(false);
@@ -117,9 +122,22 @@ export function RecordEditor({
       </View>
 
       <RecordSpecificFields
+        attachments={value.attachments}
         initialValue={detailsFor(type, initialValue?.details)}
+        onAdd={(attachment) => {
+          setValue((current) => ({
+            ...current,
+            attachments: [...current.attachments, attachment],
+          }));
+        }}
         onChange={(details) => {
           setValue((current) => ({ ...current, details }));
+        }}
+        onRemove={(index) => {
+          setValue((current) => ({
+            ...current,
+            attachments: current.attachments.filter((_, attachmentIndex) => attachmentIndex !== index),
+          }));
         }}
         resetKey={`${type}:${initialKey}`}
         type={type}
@@ -171,17 +189,23 @@ export function toNewRecordInput(draft: RecordDraft): NewRecordInput {
 function RecordSpecificFields({
   type,
   initialValue,
+  attachments,
   resetKey,
   onChange,
+  onAdd,
+  onRemove,
 }: {
   type: RecordType;
   initialValue: EditableDetails;
+  attachments: RecordDraftAttachment[];
   resetKey: string;
   onChange(details: EditableDetails): void;
+  onAdd(attachment: Extract<RecordDraftAttachment, { kind: 'picked' }>): void;
+  onRemove(index: number): void;
 }) {
   switch (type) {
     case 'moment':
-      return <MomentFields />;
+      return <MomentFields attachments={attachments} onAdd={onAdd} onRemove={onRemove} />;
     case 'growth':
       return (
         <GrowthFields
@@ -201,8 +225,11 @@ function RecordSpecificFields({
     case 'milestone':
       return (
         <MilestoneFields
+          attachments={attachments}
           initialValue={asMilestoneDetails(initialValue)}
           onChange={onChange}
+          onAdd={onAdd}
+          onRemove={onRemove}
           resetKey={resetKey}
         />
       );

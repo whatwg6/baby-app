@@ -1,7 +1,8 @@
 import { useLocalSearchParams, useRouter, type Href } from 'expo-router';
 
 import type { RecordType } from '../../src/domain/types';
-import { RecordEditor, toNewRecordInput } from '../../src/features/records/RecordEditor';
+import { mediaService, saveRecordWithMedia } from '../../src/features/media/mediaService';
+import { RecordEditor } from '../../src/features/records/RecordEditor';
 import { useRecordRepository } from '../../src/features/records/RecordRepositoryProvider';
 import { RecordTypePicker } from '../../src/features/records/RecordTypePicker';
 
@@ -22,7 +23,7 @@ export default function NewRecordRoute() {
   return (
     <RecordEditor
       onSubmit={async (draft) => {
-        await repository.create(toNewRecordInput(draft));
+        await saveRecordWithMedia(draft, { records: repository, media: mediaService });
         router.replace('/(tabs)/timeline' as Href);
       }}
       type={type}
