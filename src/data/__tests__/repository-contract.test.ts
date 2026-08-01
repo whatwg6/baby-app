@@ -55,29 +55,32 @@ class SQLiteRepositoryDouble {
   private milestoneDetails = new Map<string, MilestoneDetails>();
   private attachments = new Map<string, AttachmentRow>();
   private babies: BabyRow[] = [];
-  private transactionActive = false;
+  private transactionQueue: Promise<void> = Promise.resolve();
+  private babyReadFailures = 0;
 
   get babyRowCount(): number {
     return this.babies.length;
   }
 
+  failNextBabyRead(): void {
+    this.babyReadFailures += 1;
+  }
+
   async withExclusiveTransactionAsync(
     work: (transaction: SQLiteDatabase) => Promise<void>,
   ): Promise<void> {
-    if (this.transactionActive) {
-      throw new Error('Nested transaction');
-    }
-
-    const snapshot = this.snapshot();
-    this.transactionActive = true;
-    try {
-      await work(this as unknown as SQLiteDatabase);
-    } catch (error) {
-      this.restore(snapshot);
-      throw error;
-    } finally {
-      this.transactionActive = false;
-    }
+    const execute = async () => {
+      const snapshot = this.snapshot();
+      try {
+        await work(this as unknown as SQLiteDatabase);
+      } catch (error) {
+        this.restore(snapshot);
+        throw error;
+      }
+    };
+    const pending = this.transactionQueue.then(execute, execute);
+    this.transactionQueue = pending.catch(() => undefined);
+    await pending;
   }
 
   async runAsync(sql: string, ...rawParams: unknown[]): Promise<{ changes: number }> {
@@ -290,6 +293,10 @@ class SQLiteRepositoryDouble {
     const recordId = params[0] as string;
 
     if (sql.includes('FROM baby')) {
+      if (this.babyReadFailures > 0) {
+        this.babyReadFailures -= 1;
+        throw new Error('baby read failed after write');
+      }
       return (this.babies[0] ?? null) as T | null;
     }
     if (sql.includes('FROM records')) {
@@ -333,6 +340,7 @@ class SQLiteRepositoryDouble {
       activityDetails: new Map(this.activityDetails),
       milestoneDetails: new Map(this.milestoneDetails),
       attachments: new Map(this.attachments),
+      babies: this.babies.map((baby) => ({ ...baby })),
     };
   }
 
@@ -342,6 +350,7 @@ class SQLiteRepositoryDouble {
     this.activityDetails = snapshot.activityDetails;
     this.milestoneDetails = snapshot.milestoneDetails;
     this.attachments = snapshot.attachments;
+    this.babies = snapshot.babies;
   }
 }
 
@@ -469,5 +478,23 @@ describe('SQLite BabyRepository mapping', () => {
     ]);
 
     expect(database.babyRowCount).toBe(1);
+  });
+
+  test('rolls back an applied baby upsert when its verification read fails', async () => {
+    const database = new SQLiteRepositoryDouble();
+    const babies = createSQLiteRepositories(database as unknown as SQLiteDatabase).babies;
+    const original = await babies.save({
+      ...babyInputFixture(),
+      avatarPath: 'file:///documents/media/old.jpg',
+    });
+    database.failNextBabyRead();
+
+    await expect(babies.save({
+      ...babyInputFixture(),
+      name: '乐乐',
+      avatarPath: 'file:///documents/media/new.jpg',
+    })).rejects.toThrow('baby read failed after write');
+
+    await expect(babies.get()).resolves.toEqual(original);
   });
 });

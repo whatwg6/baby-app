@@ -1,39 +1,56 @@
-import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react';
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from 'react';
 
 import type { BabyRepository } from '../../data/repositories';
 import type { Baby, BabyInput } from '../../domain/types';
 import {
+  CLEANUP_PENDING_MESSAGE,
   mediaService,
+  type MediaCleanupIssue,
   type MediaService,
   type StagedMedia,
 } from '../media/mediaService';
 import type { PickedAvatar } from './BabyForm';
 
-const BabyRepositoryContext = createContext<BabyRepository | null>(null);
+type BabyServices = { repository: BabyRepository; media: MediaService };
+
+const BabyRepositoryContext = createContext<BabyServices | null>(null);
 
 export function BabyRepositoryProvider({
   repository,
+  media = mediaService,
   children,
 }: {
   repository: BabyRepository;
+  media?: MediaService;
   children: ReactNode;
 }) {
+  const services = useMemo(() => ({ repository, media }), [media, repository]);
   return (
-    <BabyRepositoryContext.Provider value={repository}>
+    <BabyRepositoryContext.Provider value={services}>
       {children}
     </BabyRepositoryContext.Provider>
   );
 }
 
 export function useBaby() {
-  const repository = useContext(BabyRepositoryContext);
+  const services = useContext(BabyRepositoryContext);
   const [baby, setBaby] = useState<Baby | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
+  const [cleanupWarning, setCleanupWarning] = useState<string | null>(null);
 
-  if (repository === null) {
+  if (services === null) {
     throw new Error('useBaby must be used within BabyRepositoryProvider.');
   }
+  const { repository, media } = services;
 
   const reload = useCallback(async () => {
     setLoading(true);
@@ -54,28 +71,42 @@ export function useBaby() {
   }, [reload]);
 
   const save = useCallback(async (input: BabyInput, pickedAvatar?: PickedAvatar) => {
+    setCleanupWarning(null);
     const saved = await saveBabyWithAvatar(input, pickedAvatar, {
       babies: repository,
-      media: mediaService,
+      media,
+      onCleanupPending: () => setCleanupWarning(CLEANUP_PENDING_MESSAGE),
     });
     setBaby(saved);
     return saved;
-  }, [repository]);
+  }, [media, repository]);
 
-  return { baby, loading, error, save, reload };
+  return { baby, loading, error, cleanupWarning, save, reload };
 }
 
 export async function saveBabyWithAvatar(
   input: BabyInput,
   pickedAvatar: PickedAvatar | undefined,
-  dependencies: { babies: BabyRepository; media: MediaService },
+  dependencies: {
+    babies: BabyRepository;
+    media: MediaService;
+    onCleanupPending?(issue: MediaCleanupIssue): void;
+  },
 ): Promise<Baby> {
   const previous = await dependencies.babies.get();
   if (pickedAvatar === undefined) {
     const saved = await dependencies.babies.save(input);
     if (previous?.avatarPath !== null && previous?.avatarPath !== undefined &&
         previous.avatarPath !== saved.avatarPath) {
-      await dependencies.media.remove([previous.avatarPath]);
+      try {
+        await dependencies.media.remove([previous.avatarPath]);
+      } catch (cause) {
+        dependencies.onCleanupPending?.({
+          scope: 'avatar',
+          paths: [previous.avatarPath],
+          cause,
+        });
+      }
     }
     return saved;
   }
@@ -103,7 +134,11 @@ export async function saveBabyWithAvatar(
       previous.avatarPath === saved.avatarPath ? [] : [previous.avatarPath]),
   ];
   if (pathsToRemove.length > 0) {
-    await dependencies.media.remove(pathsToRemove);
+    try {
+      await dependencies.media.remove(pathsToRemove);
+    } catch (cause) {
+      dependencies.onCleanupPending?.({ scope: 'avatar', paths: pathsToRemove, cause });
+    }
   }
   return saved;
 }

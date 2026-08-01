@@ -1,5 +1,5 @@
 import { render, waitFor } from '@testing-library/react-native';
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { Text } from 'react-native';
 
 import type { BabyInput } from '../../../domain/types';
@@ -84,6 +84,67 @@ test('removes the new avatar and preserves the old one when saving fails', async
   ]);
   await expect(repository.get()).resolves.toMatchObject({
     avatarPath: 'file:///documents/media/old.jpg',
+  });
+});
+
+test('keeps the saved avatar and reports cleanup pending when old-avatar removal fails', async () => {
+  const repository = new MemoryBabyRepository();
+  await repository.save({ ...input, avatarPath: 'file:///documents/media/old.jpg' });
+  const media = avatarMedia([]);
+  const cleanupError = new Error('old avatar is locked');
+  media.remove.mockRejectedValue(cleanupError);
+  const onCleanupPending = jest.fn();
+
+  await expect(saveBabyWithAvatar(input, { sourceUri: 'file:///picker/new.jpg' }, {
+    babies: repository,
+    media,
+    onCleanupPending,
+  })).resolves.toMatchObject({
+    avatarPath: 'file:///documents/media/new.jpg',
+  });
+
+  await expect(repository.get()).resolves.toMatchObject({
+    avatarPath: 'file:///documents/media/new.jpg',
+  });
+  expect(onCleanupPending).toHaveBeenCalledWith({
+    scope: 'avatar',
+    paths: [
+      'file:///documents/media/new-thumb.jpg',
+      'file:///documents/media/old.jpg',
+    ],
+    cause: cleanupError,
+  });
+});
+
+test('exposes a cleanup-pending warning while retaining the newly saved avatar', async () => {
+  const repository = new MemoryBabyRepository();
+  await repository.save({ ...input, avatarPath: 'file:///documents/media/old.jpg' });
+  const media = avatarMedia([]);
+  media.remove.mockRejectedValue(new Error('old avatar is locked'));
+
+  function ProfileProbe() {
+    const { baby, cleanupWarning, loading, save } = useBaby();
+    const started = useRef(false);
+
+    useEffect(() => {
+      if (!loading && !started.current) {
+        started.current = true;
+        void save(input, { sourceUri: 'file:///picker/new.jpg' });
+      }
+    }, [loading, save]);
+
+    return <Text>{cleanupWarning ?? baby?.avatarPath ?? '加载中'}</Text>;
+  }
+
+  const view = await render(
+    <BabyRepositoryProvider media={media} repository={repository}>
+      <ProfileProbe />
+    </BabyRepositoryProvider>,
+  );
+
+  expect(await view.findByText('已保存，旧媒体将在稍后清理')).toBeTruthy();
+  await expect(repository.get()).resolves.toMatchObject({
+    avatarPath: 'file:///documents/media/new.jpg',
   });
 });
 

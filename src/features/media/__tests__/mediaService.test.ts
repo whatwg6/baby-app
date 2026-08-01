@@ -257,6 +257,40 @@ describe('record media transaction coordination', () => {
     ]);
   });
 
+  test('returns the saved update and reports cleanup pending when old-media removal fails', async () => {
+    const events: string[] = [];
+    const staged = stagedImage();
+    const media = createMockMedia(staged, events);
+    const cleanupError = new Error('old media is locked');
+    media.remove.mockRejectedValue(cleanupError);
+    const old = timelineRecord({
+      attachments: [{
+        id: 'old-attachment',
+        recordId: 'record-1',
+        mediaType: 'image',
+        filePath: 'file:///documents/media/old.jpg',
+        thumbnailPath: null,
+        createdAt: '2026-07-01T00:00:00.000Z',
+      }],
+    });
+    const records = createRecordRepository(events, undefined, old);
+    const onCleanupPending = jest.fn();
+
+    await expect(updateRecordWithMedia('record-1', imageDraft, {
+      records,
+      media,
+      onCleanupPending,
+    })).resolves.toMatchObject({
+      attachments: [{ filePath: staged.finalPath }],
+    });
+
+    expect(onCleanupPending).toHaveBeenCalledWith({
+      scope: 'record',
+      paths: ['file:///documents/media/old.jpg'],
+      cause: cleanupError,
+    });
+  });
+
   test('preserves old update media when the database commit fails', async () => {
     const events: string[] = [];
     const staged = stagedImage();

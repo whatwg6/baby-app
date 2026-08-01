@@ -25,6 +25,20 @@ export interface MediaService {
   removeOrphans(referencedPaths: string[]): Promise<void>;
 }
 
+export interface MediaCleanupIssue {
+  scope: 'record' | 'avatar';
+  paths: string[];
+  cause: unknown;
+}
+
+export const CLEANUP_PENDING_MESSAGE = '已保存，旧媒体将在稍后清理';
+
+type RecordMediaDependencies = {
+  records: RecordRepository;
+  media: MediaService;
+  onCleanupPending?(issue: MediaCleanupIssue): void;
+};
+
 export interface MediaFileSystem {
   readonly documentDirectory: string;
   availableDiskSpace(): number;
@@ -170,7 +184,7 @@ export function createMediaService(dependencies: MediaServiceDependencies = {}):
 
 export async function saveRecordWithMedia(
   input: RecordDraft,
-  dependencies: { records: RecordRepository; media: MediaService },
+  dependencies: RecordMediaDependencies,
 ): Promise<TimelineRecord> {
   return persistRecordWithMedia('create', null, input, dependencies);
 }
@@ -178,7 +192,7 @@ export async function saveRecordWithMedia(
 export async function updateRecordWithMedia(
   id: string,
   input: RecordDraft,
-  dependencies: { records: RecordRepository; media: MediaService },
+  dependencies: RecordMediaDependencies,
 ): Promise<TimelineRecord> {
   const previous = await dependencies.records.get(id);
   if (previous === null) {
@@ -189,7 +203,11 @@ export async function updateRecordWithMedia(
   const retainedPaths = new Set(attachmentPaths(saved));
   const removedPaths = attachmentPaths(previous).filter((path) => !retainedPaths.has(path));
   if (removedPaths.length > 0) {
-    await dependencies.media.remove(removedPaths);
+    try {
+      await dependencies.media.remove(removedPaths);
+    } catch (cause) {
+      dependencies.onCleanupPending?.({ scope: 'record', paths: removedPaths, cause });
+    }
   }
   return saved;
 }
@@ -214,7 +232,7 @@ async function persistRecordWithMedia(
   operation: 'create' | 'update',
   id: string | null,
   draft: RecordDraft,
-  dependencies: { records: RecordRepository; media: MediaService },
+  dependencies: RecordMediaDependencies,
 ): Promise<TimelineRecord> {
   const stagedMedia: StagedMedia[] = [];
   const committedPaths: string[] = [];

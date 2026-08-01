@@ -6,7 +6,7 @@ import { useBaby } from '../../src/features/baby/useBaby';
 import { colors, spacing } from '../../src/ui/theme';
 
 export default function BabySetupScreen() {
-  const { error, loading, reload, save } = useBaby();
+  const { cleanupWarning, error, loading, reload, save } = useBaby();
   const router = useRouter();
 
   if (loading) {
@@ -32,6 +32,9 @@ export default function BabySetupScreen() {
     <View style={styles.container}>
       <Text style={styles.heading}>先认识一下宝宝</Text>
       <Text style={styles.subheading}>填写姓名和生日，就可以开始记录成长。</Text>
+      {cleanupWarning === null ? null : (
+        <Text style={styles.warning}>{cleanupWarning}</Text>
+      )}
       <BabyForm
         onSave={async (input) => {
           await save(input);
@@ -51,4 +54,5 @@ const styles = StyleSheet.create({
   heading: { color: colors.text, fontSize: 26, fontWeight: '700', marginTop: spacing.xl },
   subheading: { color: colors.muted, fontSize: 15, lineHeight: 22, marginBottom: spacing.xl, marginTop: spacing.sm },
   retry: { color: colors.accent, fontSize: 16, fontWeight: '700' },
+  warning: { color: colors.muted, marginBottom: spacing.md },
 });

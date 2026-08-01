@@ -68,38 +68,38 @@ class SQLiteBabyRepository implements BabyRepository {
   constructor(private readonly database: SQLiteDatabase) {}
 
   async get(): Promise<Baby | null> {
-    const row = await this.database.getFirstAsync<BabyRow>(`
-      SELECT id, name, birth_date, sex, avatar_path, created_at, updated_at
-      FROM baby
-      WHERE singleton = 1;
-    `);
-
-    return row === null ? null : toBaby(row);
+    return getBaby(this.database);
   }
 
   async save(input: BabyInput): Promise<Baby> {
     const now = new Date().toISOString();
-    await this.database.runAsync(
-      `INSERT INTO baby (
-        singleton, id, name, birth_date, sex, avatar_path, created_at, updated_at
-      ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(singleton) DO UPDATE SET
-        name = excluded.name,
-        birth_date = excluded.birth_date,
-        sex = excluded.sex,
-        avatar_path = excluded.avatar_path,
-        updated_at = excluded.updated_at;`,
-      [
-        createId(),
-        input.name,
-        input.birthDate,
-        input.sex,
-        input.avatarPath,
-        now,
-        now,
-      ],
-    );
-    const saved = await this.get();
+    let saved: Baby | null = null;
+    await this.database.withExclusiveTransactionAsync(async (database) => {
+      await database.runAsync(
+        `INSERT INTO baby (
+          singleton, id, name, birth_date, sex, avatar_path, created_at, updated_at
+        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(singleton) DO UPDATE SET
+          name = excluded.name,
+          birth_date = excluded.birth_date,
+          sex = excluded.sex,
+          avatar_path = excluded.avatar_path,
+          updated_at = excluded.updated_at;`,
+        [
+          createId(),
+          input.name,
+          input.birthDate,
+          input.sex,
+          input.avatarPath,
+          now,
+          now,
+        ],
+      );
+      saved = await getBaby(database);
+      if (saved === null) {
+        throw new Error('Baby profile was not saved.');
+      }
+    });
     if (saved === null) {
       throw new Error('Baby profile was not saved.');
     }
@@ -109,6 +109,15 @@ class SQLiteBabyRepository implements BabyRepository {
   async clear(): Promise<void> {
     await this.database.runAsync('DELETE FROM baby;');
   }
+}
+
+async function getBaby(database: SQLiteDatabase): Promise<Baby | null> {
+  const row = await database.getFirstAsync<BabyRow>(`
+    SELECT id, name, birth_date, sex, avatar_path, created_at, updated_at
+    FROM baby
+    WHERE singleton = 1;
+  `);
+  return row === null ? null : toBaby(row);
 }
 
 class SQLiteRecordTransaction implements RecordTransaction {

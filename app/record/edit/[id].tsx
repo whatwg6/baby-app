@@ -1,10 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useLocalSearchParams, useRouter, type Href } from 'expo-router';
 
 import type { RecordRepository } from '../../../src/data/repositories';
 import type { RecordDraft, TimelineRecord } from '../../../src/domain/types';
-import { mediaService, updateRecordWithMedia } from '../../../src/features/media/mediaService';
+import {
+  CLEANUP_PENDING_MESSAGE,
+  mediaService,
+  updateRecordWithMedia,
+  type MediaService,
+} from '../../../src/features/media/mediaService';
 import { RecordEditor } from '../../../src/features/records/RecordEditor';
 import { useRecordRepository } from '../../../src/features/records/RecordRepositoryProvider';
 import { colors, spacing } from '../../../src/ui/theme';
@@ -19,7 +24,13 @@ type RecordLoadState = {
   error: string | null;
 };
 
-export default function EditRecordRoute() {
+export default function EditRecordRoute({
+  media = mediaService,
+  showCleanupPending = (message) => Alert.alert(message),
+}: {
+  media?: MediaService;
+  showCleanupPending?(message: string): void;
+} = {}) {
   const repository = useRecordRepository();
   const router = useRouter();
   const { id } = useLocalSearchParams<{ id?: string | string[] }>();
@@ -88,7 +99,8 @@ export default function EditRecordRoute() {
       onSubmit={async (draft) => {
         await updateRecordWithMedia(recordId, draft, {
           records: repository,
-          media: mediaService,
+          media,
+          onCleanupPending: () => showCleanupPending(CLEANUP_PENDING_MESSAGE),
         });
         router.replace(`/record/${recordId}` as Href);
       }}

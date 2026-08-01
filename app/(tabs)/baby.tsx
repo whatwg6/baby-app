@@ -8,7 +8,7 @@ import { useBaby } from '../../src/features/baby/useBaby';
 import { colors, spacing } from '../../src/ui/theme';
 
 export default function BabyScreen() {
-  const { baby, error, loading, reload, save } = useBaby();
+  const { baby, cleanupWarning, error, loading, reload, save } = useBaby();
   const router = useRouter();
 
   useEffect(() => {
@@ -28,6 +28,9 @@ export default function BabyScreen() {
             <Text style={styles.retry}>重试</Text>
           </Pressable>
         </View>
+      )}
+      {cleanupWarning === null ? null : (
+        <Text style={styles.warning}>{cleanupWarning}</Text>
       )}
       {baby === null ? null : (
         <View style={styles.content}>
@@ -53,5 +56,6 @@ const styles = StyleSheet.create({
   status: { color: colors.muted, marginTop: spacing.lg },
   errorState: { gap: spacing.md },
   retry: { color: colors.accent, fontSize: 16, fontWeight: '700' },
+  warning: { color: colors.muted, marginTop: spacing.md },
   content: { gap: spacing.xl, marginTop: spacing.lg },
 });
