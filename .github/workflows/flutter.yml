@@ -1,0 +1,28 @@
+name: Flutter
+
+on:
+  pull_request:
+    paths:
+      - "apps/flutter/**"
+      - ".github/workflows/flutter.yml"
+  push:
+    branches: [main]
+    paths:
+      - "apps/flutter/**"
+      - ".github/workflows/flutter.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/flutter
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get --enforce-lockfile
+      - run: flutter analyze
+      - run: flutter test

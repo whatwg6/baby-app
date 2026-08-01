@@ -3,12 +3,13 @@
   "compilerOptions": {
     "strict": true,
     "jsx": "react-jsx",
-    "types": ["jest", "react"]
+    "types": [
+      "jest",
+      "react"
+    ]
   },
   "include": [
     "**/*.ts",
-    "**/*.tsx",
-    ".expo/types/**/*.ts",
-    "expo-env.d.ts"
+    "**/*.tsx"
   ]
 }

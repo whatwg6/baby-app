@@ -1,0 +1,21 @@
+.superpowers/
+.worktrees/
+
+# Flutter and Dart tool output
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub/
+.pub-cache/
+build/
+
+# IDE and operating-system files
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+*.log
+*.swp
+.DS_Store

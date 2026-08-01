@@ -1,0 +1,32 @@
+name: React Native
+
+on:
+  pull_request:
+    paths:
+      - "apps/react-native/**"
+      - ".github/workflows/react-native.yml"
+  push:
+    branches: [main]
+    paths:
+      - "apps/react-native/**"
+      - ".github/workflows/react-native.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/react-native
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/react-native/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test -- --runInBand
+      - run: pnpm typecheck

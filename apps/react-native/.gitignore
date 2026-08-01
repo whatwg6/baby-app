@@ -1,6 +1,8 @@
-.DS_Store
 .superpowers/
 .worktrees/
+.pnpm-store
 node_modules/
-.pnpm-store/
 .expo/
+dist/
+ios/
+android/
