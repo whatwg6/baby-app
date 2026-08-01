@@ -1,2 +1,7 @@
 .superpowers/
 .worktrees/
+node_modules/
+.expo/
+dist/
+ios/
+android/

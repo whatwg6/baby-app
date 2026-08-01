@@ -1,0 +1,19 @@
+{
+  "expo": {
+    "name": "Baby Growth Timeline",
+    "slug": "baby-growth-timeline",
+    "version": "1.0.0",
+    "scheme": "babygrowth",
+    "plugins": [
+      "expo-router",
+      "expo-image-picker",
+      "expo-document-picker"
+    ],
+    "ios": {
+      "bundleIdentifier": "com.local.babygrowth"
+    },
+    "android": {
+      "package": "com.local.babygrowth"
+    }
+  }
+}
