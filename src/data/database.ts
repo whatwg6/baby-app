@@ -33,23 +33,25 @@ class ExpoDatabaseManager implements DatabaseManager {
   ): Promise<T> {
     return this.withLifecycle(async () => {
       const database = await this.initializeOpen();
-      let closed = false;
+      let closeCompleted = false;
 
       try {
         await database.execAsync('PRAGMA wal_checkpoint(TRUNCATE);');
         await database.closeAsync();
-        closed = true;
-        if (this.database === database) {
-          this.database = null;
-        }
+        closeCompleted = true;
+        this.invalidateDatabase(database);
 
         return await work(database.databasePath);
       } finally {
-        if (closed) {
-          await this.initializeOpen();
-        } else {
-          await migrateDatabase(database);
+        this.invalidateDatabase(database);
+        if (!closeCompleted) {
+          try {
+            await database.closeAsync();
+          } catch {
+            // The original checkpoint or close error is more actionable.
+          }
         }
+        await this.initializeOpen();
       }
     });
   }
@@ -87,6 +89,12 @@ class ExpoDatabaseManager implements DatabaseManager {
       return await work();
     } finally {
       release?.();
+    }
+  }
+
+  private invalidateDatabase(database: SQLiteDatabase): void {
+    if (this.database === database) {
+      this.database = null;
     }
   }
 

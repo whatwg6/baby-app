@@ -3,8 +3,6 @@ import type { SQLiteDatabase } from 'expo-sqlite';
 const LATEST_DATABASE_VERSION = 1;
 
 const VERSION_1_SCHEMA = `
-  BEGIN;
-
   CREATE TABLE IF NOT EXISTS baby (
     singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
     id TEXT NOT NULL UNIQUE,
@@ -64,7 +62,6 @@ const VERSION_1_SCHEMA = `
     ON attachments (record_id);
 
   PRAGMA user_version = 1;
-  COMMIT;
 `;
 
 export async function migrateDatabase(database: SQLiteDatabase): Promise<void> {
@@ -82,6 +79,22 @@ export async function migrateDatabase(database: SQLiteDatabase): Promise<void> {
   }
 
   if (currentVersion < 1) {
-    await database.execAsync(VERSION_1_SCHEMA);
+    let transactionStarted = false;
+    try {
+      await database.execAsync('BEGIN;');
+      transactionStarted = true;
+      await database.execAsync(VERSION_1_SCHEMA);
+      await database.execAsync('COMMIT;');
+      transactionStarted = false;
+    } catch (error) {
+      if (transactionStarted) {
+        try {
+          await database.execAsync('ROLLBACK;');
+        } catch {
+          // The original migration error is the actionable failure.
+        }
+      }
+      throw error;
+    }
   }
 }
