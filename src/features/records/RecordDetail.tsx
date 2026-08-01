@@ -5,7 +5,9 @@ import type { RecordRepository } from '../../data/repositories';
 import type { ActivityDetails, GrowthDetails, MilestoneDetails, TimelineRecord } from '../../domain/types';
 import { colors, radius, spacing } from '../../ui/theme';
 import { MediaPreview } from '../media/MediaPreview';
+import { mediaService, type MediaService } from '../media/mediaService';
 import { recordTypeLabel } from '../timeline/TimelineCard';
+import { DeleteRecordButton } from './DeleteRecordButton';
 
 const loadErrorMessage = '无法读取记录，请重试';
 
@@ -14,11 +16,13 @@ export function RecordDetail({
   recordId,
   onEdit,
   onDelete,
+  media = mediaService,
 }: {
   repository: RecordRepository;
   recordId: string;
   onEdit?(target: string): void;
   onDelete?(): void;
+  media?: MediaService;
 }) {
   const [record, setRecord] = useState<TimelineRecord | null>(null);
   const [loading, setLoading] = useState(true);
@@ -84,15 +88,13 @@ export function RecordDetail({
         >
           <Text style={styles.editActionText}>编辑</Text>
         </Pressable>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityState={{ disabled: onDelete === undefined }}
+        <DeleteRecordButton
           disabled={onDelete === undefined}
-          onPress={() => onDelete?.()}
-          style={[styles.deleteAction, onDelete === undefined ? styles.disabledAction : null]}
-        >
-          <Text style={styles.deleteActionText}>删除</Text>
-        </Pressable>
+          media={media}
+          onDeleted={onDelete}
+          recordId={record.id}
+          repository={repository}
+        />
       </View>
     </View>
   );
@@ -174,9 +176,6 @@ const styles = StyleSheet.create({
   actions: { flexDirection: 'row', gap: spacing.sm, marginTop: spacing.md },
   editAction: { backgroundColor: colors.accent, borderRadius: radius.md, padding: spacing.md },
   editActionText: { color: colors.card, fontSize: 16, fontWeight: '700' },
-  deleteAction: { borderColor: colors.danger, borderRadius: radius.md, borderWidth: 1, padding: spacing.md },
-  disabledAction: { opacity: 0.45 },
-  deleteActionText: { color: colors.danger, fontSize: 16, fontWeight: '700' },
 });
 
 export default RecordDetail;

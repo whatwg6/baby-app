@@ -4,6 +4,8 @@ import AddScreen from '../../app/(tabs)/add';
 import BabyScreen from '../../app/(tabs)/baby';
 import TimelineScreen from '../../app/(tabs)/timeline';
 import { BabyRepositoryProvider } from '../features/baby/useBaby';
+import { BackupServiceProvider } from '../features/backup/BackupActions';
+import type { BackupService } from '../features/backup/backupService';
 import { RecordRepositoryProvider } from '../features/records/RecordRepositoryProvider';
 import { babyInputFixture } from '../test/fixtures';
 import { MemoryBabyRepository, MemoryRecordRepository } from '../test/memoryRepositories';
@@ -41,4 +43,27 @@ test('shows the baby profile heading', async () => {
   );
 
   expect(screen.getByText('宝宝资料')).toBeTruthy();
+});
+
+test('shows backup and destructive data actions for an existing baby', async () => {
+  const repository = new MemoryBabyRepository();
+  await repository.save(babyInputFixture());
+  const backup: jest.Mocked<BackupService> = {
+    export: jest.fn(),
+    inspect: jest.fn(),
+    restore: jest.fn(),
+    clear: jest.fn(),
+  };
+
+  await render(
+    <BackupServiceProvider service={backup}>
+      <BabyRepositoryProvider repository={repository}>
+        <BabyScreen />
+      </BabyRepositoryProvider>
+    </BackupServiceProvider>,
+  );
+
+  expect(await screen.findByRole('button', { name: '导出备份' })).toBeTruthy();
+  expect(screen.getByRole('button', { name: '从备份恢复' })).toBeTruthy();
+  expect(screen.getByRole('button', { name: '清空全部数据' })).toBeTruthy();
 });

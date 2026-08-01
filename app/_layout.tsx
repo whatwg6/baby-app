@@ -1,26 +1,37 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { Stack } from 'expo-router';
 
-import { createDatabaseManager } from '../src/data/database';
+import { createDatabaseManager, type DatabaseManager } from '../src/data/database';
 import { createSQLiteRepositories, type SQLiteRepositories } from '../src/data/repositories';
 import { BabyRepositoryProvider } from '../src/features/baby/useBaby';
+import { BackupServiceProvider } from '../src/features/backup/BackupActions';
+import { createBackupService } from '../src/features/backup/backupService';
 import { mediaService, removeUnreferencedMedia } from '../src/features/media/mediaService';
 import { RecordRepositoryProvider } from '../src/features/records/RecordRepositoryProvider';
 import { colors, spacing } from '../src/ui/theme';
 
 export default function RootLayout() {
+  const databaseRef = useRef<DatabaseManager | null>(null);
+  databaseRef.current ??= createDatabaseManager();
+  const database = databaseRef.current;
   const [repositories, setRepositories] = useState<SQLiteRepositories | null>(null);
   const [failed, setFailed] = useState(false);
   const [attempt, setAttempt] = useState(0);
+  const reloadServices = useCallback(() => setAttempt((value) => value + 1), []);
+  const backup = useMemo(() => repositories === null ? null : createBackupService({
+    database,
+    babies: repositories.babies,
+    records: repositories.records,
+    media: mediaService,
+  }), [database, repositories]);
 
   useEffect(() => {
     let active = true;
     setRepositories(null);
     setFailed(false);
 
-    void createDatabaseManager()
-      .initialize()
+    void database.initialize()
       .then(async (database) => {
         const initialized = createSQLiteRepositories(database);
         await removeUnreferencedMedia({
@@ -44,7 +55,7 @@ export default function RootLayout() {
     return () => {
       active = false;
     };
-  }, [attempt]);
+  }, [attempt, database]);
 
   if (repositories === null) {
     return (
@@ -59,12 +70,18 @@ export default function RootLayout() {
     );
   }
 
+  if (backup === null) {
+    return null;
+  }
+
   return (
-    <BabyRepositoryProvider repository={repositories.babies}>
-      <RecordRepositoryProvider repository={repositories.records}>
-        <Stack screenOptions={{ headerShown: false }} />
-      </RecordRepositoryProvider>
-    </BabyRepositoryProvider>
+    <BackupServiceProvider onDataChanged={reloadServices} service={backup}>
+      <BabyRepositoryProvider repository={repositories.babies}>
+        <RecordRepositoryProvider repository={repositories.records}>
+          <Stack screenOptions={{ headerShown: false }} />
+        </RecordRepositoryProvider>
+      </BabyRepositoryProvider>
+    </BackupServiceProvider>
   );
 }
 

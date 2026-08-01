@@ -1,10 +1,11 @@
 import { useEffect } from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useRouter } from 'expo-router';
 
 import BabyForm from '../../src/features/baby/BabyForm';
 import BabyHeader from '../../src/features/baby/BabyHeader';
 import { useBaby } from '../../src/features/baby/useBaby';
+import { BackupActions } from '../../src/features/backup/BackupActions';
 import { colors, spacing } from '../../src/ui/theme';
 
 export default function BabyScreen() {
@@ -18,7 +19,7 @@ export default function BabyScreen() {
   }, [baby, error, loading, router]);
 
   return (
-    <View style={styles.container}>
+    <ScrollView contentContainerStyle={styles.container}>
       <Text style={styles.title}>宝宝资料</Text>
       {loading ? <Text style={styles.status}>正在读取资料…</Text> : null}
       {error === null ? null : (
@@ -36,16 +37,17 @@ export default function BabyScreen() {
         <View style={styles.content}>
           <BabyHeader baby={baby} />
           <BabyForm initialValue={baby} onSave={save} />
+          <BackupActions babyName={baby.name} />
         </View>
       )}
-    </View>
+    </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
     backgroundColor: colors.background,
-    flex: 1,
+    flexGrow: 1,
     padding: spacing.lg,
   },
   title: {

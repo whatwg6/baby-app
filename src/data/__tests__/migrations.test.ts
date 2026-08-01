@@ -10,6 +10,7 @@ import { migrateDatabase } from '../migrations';
 interface MigrationDatabaseOptions {
   checkpointError?: Error;
   closeError?: Error;
+  rollbackError?: Error;
   schemaFailures?: number;
 }
 
@@ -64,6 +65,9 @@ class MigrationDatabase {
       return;
     }
     if (/^\s*ROLLBACK;/i.test(sql)) {
+      if (this.options.rollbackError !== undefined) {
+        throw this.options.rollbackError;
+      }
       this.transactionActive = false;
       this.transactionStartedSeparately = false;
       return;
@@ -133,6 +137,19 @@ describe('migrateDatabase', () => {
 
     expect(database.transactionActive).toBe(false);
     expect(database.userVersion).toBe(1);
+  });
+
+  test('surfaces both schema and rollback failures', async () => {
+    const rollbackError = new Error('rollback failed');
+    const database = new MigrationDatabase({ schemaFailures: 1, rollbackError });
+
+    await expect(migrateDatabase(asSQLiteDatabase(database))).rejects.toMatchObject({
+      name: 'AggregateError',
+      errors: expect.arrayContaining([
+        expect.objectContaining({ message: 'schema statement failed' }),
+        rollbackError,
+      ]),
+    });
   });
 });
 
@@ -232,5 +249,43 @@ describe('DatabaseManager.withClosedDatabase', () => {
     expect(first.closeCalls).toBe(2);
     expect(openDatabase).toHaveBeenCalledTimes(2);
     expect(await manager.initialize()).toBe(asSQLiteDatabase(reopened));
+  });
+
+  test('closes a newly opened handle when migration fails during reopen', async () => {
+    const first = new MigrationDatabase();
+    const migrationFailure = new MigrationDatabase({ schemaFailures: 1 });
+    const openDatabase = jest
+      .fn<Promise<SQLiteDatabase>, [string]>()
+      .mockResolvedValueOnce(asSQLiteDatabase(first))
+      .mockResolvedValueOnce(asSQLiteDatabase(migrationFailure));
+    const manager = createDatabaseManager('baby-growth.db', openDatabase);
+
+    await expect(manager.withClosedDatabase(async () => undefined)).rejects.toThrow(
+      'schema statement failed',
+    );
+
+    expect(migrationFailure.closed).toBe(true);
+  });
+
+  test('surfaces a repeated close cleanup failure with the primary close error', async () => {
+    const first = new MigrationDatabase();
+    const firstCloseError = new Error('first close failed');
+    const cleanupCloseError = new Error('cleanup close failed');
+    first.closeAsync = jest.fn(async () => {
+      first.closeCalls += 1;
+      first.closed = true;
+      throw first.closeCalls === 1 ? firstCloseError : cleanupCloseError;
+    });
+    const reopened = new MigrationDatabase();
+    const openDatabase = jest
+      .fn<Promise<SQLiteDatabase>, [string]>()
+      .mockResolvedValueOnce(asSQLiteDatabase(first))
+      .mockResolvedValueOnce(asSQLiteDatabase(reopened));
+    const manager = createDatabaseManager('baby-growth.db', openDatabase);
+
+    await expect(manager.withClosedDatabase(async () => undefined)).rejects.toMatchObject({
+      name: 'AggregateError',
+      errors: [firstCloseError, cleanupCloseError],
+    });
   });
 });

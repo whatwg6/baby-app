@@ -90,8 +90,11 @@ export async function migrateDatabase(database: SQLiteDatabase): Promise<void> {
       if (transactionStarted) {
         try {
           await database.execAsync('ROLLBACK;');
-        } catch {
-          // The original migration error is the actionable failure.
+        } catch (rollbackError) {
+          throw new AggregateError(
+            [error, rollbackError],
+            'Database migration and rollback both failed.',
+          );
         }
       }
       throw error;

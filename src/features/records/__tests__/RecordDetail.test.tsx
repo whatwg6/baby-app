@@ -1,6 +1,8 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import { Alert } from 'react-native';
 
 import type { RecordRepository } from '../../../data/repositories';
+import type { MediaService } from '../../media/mediaService';
 import RecordDetail from '../RecordDetail';
 import { MemoryRecordRepository } from '../../../test/memoryRepositories';
 
@@ -70,4 +72,42 @@ test('retries a failed record lookup', async () => {
   });
 
   await waitFor(() => expect(screen.getByText('会翻身')).toBeTruthy());
+});
+
+test('routes the detail delete action through irreversible confirmation', async () => {
+  const repository = new MemoryRecordRepository();
+  const record = await repository.create({
+    type: 'moment',
+    occurredAt: '2026-08-02T09:30:00.000Z',
+    note: '第一次散步',
+    details: null,
+    attachments: [],
+  });
+  const onDelete = jest.fn();
+  const alert = jest.spyOn(Alert, 'alert');
+  const media: jest.Mocked<MediaService> = {
+    stage: jest.fn(),
+    commit: jest.fn(),
+    rollback: jest.fn(),
+    remove: jest.fn(async (_paths) => undefined),
+    removeOrphans: jest.fn(),
+  };
+
+  const view = await render(
+    <RecordDetail
+      media={media}
+      onDelete={onDelete}
+      recordId={record.id}
+      repository={repository}
+    />,
+  );
+  const deleteButton = await view.findByRole('button', { name: '删除' });
+  await fireEvent.press(deleteButton);
+
+  expect(alert).toHaveBeenCalledWith(
+    '删除这条记录？此操作无法撤销。',
+    undefined,
+    expect.any(Array),
+  );
+  expect(onDelete).not.toHaveBeenCalled();
 });

@@ -34,25 +34,58 @@ class ExpoDatabaseManager implements DatabaseManager {
     return this.withLifecycle(async () => {
       const database = await this.initializeOpen();
       let closeCompleted = false;
+      let value: T | undefined;
+      let workCompleted = false;
+      let primaryError: unknown;
+      const cleanupErrors: unknown[] = [];
 
       try {
         await database.execAsync('PRAGMA wal_checkpoint(TRUNCATE);');
         await database.closeAsync();
         closeCompleted = true;
         this.invalidateDatabase(database);
-
-        return await work(database.databasePath);
-      } finally {
-        this.invalidateDatabase(database);
-        if (!closeCompleted) {
-          try {
-            await database.closeAsync();
-          } catch {
-            // The original checkpoint or close error is more actionable.
-          }
-        }
-        await this.initializeOpen();
+        value = await work(database.databasePath);
+        workCompleted = true;
+      } catch (cause) {
+        primaryError = cause;
       }
+
+      this.invalidateDatabase(database);
+      if (!closeCompleted) {
+        try {
+          await database.closeAsync();
+        } catch (closeError) {
+          cleanupErrors.push(closeError);
+        }
+      }
+      try {
+        await this.initializeOpen();
+      } catch (reopenError) {
+        cleanupErrors.push(reopenError);
+      }
+
+      if (primaryError !== undefined) {
+        if (cleanupErrors.length > 0) {
+          throw new AggregateError(
+            [primaryError, ...cleanupErrors],
+            'Closed-database work failed and lifecycle recovery was incomplete.',
+          );
+        }
+        throw primaryError;
+      }
+      if (cleanupErrors.length === 1) {
+        throw cleanupErrors[0];
+      }
+      if (cleanupErrors.length > 1) {
+        throw new AggregateError(
+          cleanupErrors,
+          'Database lifecycle recovery was incomplete.',
+        );
+      }
+      if (!workCompleted) {
+        throw new Error('Closed-database work did not complete.');
+      }
+      return value as T;
     });
   }
 
@@ -100,8 +133,20 @@ class ExpoDatabaseManager implements DatabaseManager {
 
   private async openAndMigrate(): Promise<SQLiteDatabase> {
     const database = await this.openDatabase(this.databaseName);
-    await migrateDatabase(database);
-    return database;
+    try {
+      await migrateDatabase(database);
+      return database;
+    } catch (migrationError) {
+      try {
+        await database.closeAsync();
+      } catch (closeError) {
+        throw new AggregateError(
+          [migrationError, closeError],
+          'Database migration failed and the new connection could not be closed.',
+        );
+      }
+      throw migrationError;
+    }
   }
 }
 

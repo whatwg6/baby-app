@@ -14,6 +14,7 @@ export default function RecordDetailRoute() {
       repository={repository}
       recordId={recordId}
       onEdit={(target) => router.push(target as Href)}
+      onDelete={() => router.replace('/(tabs)/timeline')}
     />
   );
 }
