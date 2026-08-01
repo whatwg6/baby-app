@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { Image, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import type { ActivityDetails, GrowthDetails, MilestoneDetails, TimelineRecord } from '../../domain/types';
@@ -45,12 +46,18 @@ export function TimelineCard({
 }) {
   const firstImage = record.attachments.find((attachment) => attachment.mediaType === 'image');
   const imageUri = firstImage?.thumbnailPath || firstImage?.filePath || '';
+  const [imageUnavailable, setImageUnavailable] = useState(false);
 
   const content = (
     <>
       {record.type === 'moment' ? (
-        imageUri.trim().length > 0 ? (
-          <Image accessibilityLabel="珍贵时刻照片" source={{ uri: imageUri }} style={styles.photo} />
+        imageUri.trim().length > 0 && !imageUnavailable ? (
+          <Image
+            accessibilityLabel="珍贵时刻照片"
+            onError={() => setImageUnavailable(true)}
+            source={{ uri: imageUri }}
+            style={styles.photo}
+          />
         ) : (
           <View accessibilityLabel="媒体文件不可用" style={styles.mediaPlaceholder}>
             <Text style={styles.mediaPlaceholderText}>媒体文件不可用</Text>

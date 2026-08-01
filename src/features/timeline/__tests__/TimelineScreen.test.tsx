@@ -99,6 +99,18 @@ test('emits the selected record when a timeline card is pressed', async () => {
   expect(onRecordPress).toHaveBeenCalledWith(record);
 });
 
+test('shows a media placeholder when a moment image fails to load', async () => {
+  const repository = new MemoryRecordRepository();
+  await repository.create(momentInputFixture());
+
+  await render(<TimelineScreen repository={repository} baby={baby} />);
+
+  const image = await screen.findByLabelText('珍贵时刻照片');
+  fireEvent(image, 'error');
+
+  await waitFor(() => expect(screen.getByText('媒体文件不可用')).toBeTruthy());
+});
+
 test('retains displayed records and offers retry when a reload fails', async () => {
   const populatedRepository = new MemoryRecordRepository();
   await populatedRepository.create(momentInputFixture());
