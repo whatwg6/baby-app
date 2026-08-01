@@ -3,6 +3,8 @@ import { render, screen } from '@testing-library/react-native';
 import AddScreen from '../../app/(tabs)/add';
 import BabyScreen from '../../app/(tabs)/baby';
 import TimelineScreen from '../../app/(tabs)/timeline';
+import { BabyRepositoryProvider } from '../features/baby/useBaby';
+import { MemoryBabyRepository } from '../test/memoryRepositories';
 
 test('shows the empty timeline action', async () => {
   await render(<TimelineScreen />);
@@ -18,7 +20,13 @@ test('shows the add-record prompt', async () => {
 });
 
 test('shows the baby profile heading', async () => {
-  await render(<BabyScreen />);
+  const repository = new MemoryBabyRepository();
+
+  await render(
+    <BabyRepositoryProvider repository={repository}>
+      <BabyScreen />
+    </BabyRepositoryProvider>,
+  );
 
   expect(screen.getByText('宝宝资料')).toBeTruthy();
 });
