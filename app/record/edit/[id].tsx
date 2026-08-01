@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { useLocalSearchParams, useRouter, type Href } from 'expo-router';
 
+import type { RecordRepository } from '../../../src/data/repositories';
 import type { RecordDraft, TimelineRecord } from '../../../src/domain/types';
 import { RecordEditor, toNewRecordInput } from '../../../src/features/records/RecordEditor';
 import { useRecordRepository } from '../../../src/features/records/RecordRepositoryProvider';
@@ -9,31 +10,52 @@ import { colors, spacing } from '../../../src/ui/theme';
 
 const loadErrorMessage = '无法读取记录，请重试';
 
+type RecordLoadState = {
+  requestedId: string;
+  repository: RecordRepository;
+  record: TimelineRecord | null;
+  loading: boolean;
+  error: string | null;
+};
+
 export default function EditRecordRoute() {
   const repository = useRecordRepository();
   const router = useRouter();
   const { id } = useLocalSearchParams<{ id?: string | string[] }>();
   const recordId = typeof id === 'string' ? id : '';
-  const [record, setRecord] = useState<TimelineRecord | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const latestRequest = useRef(0);
+  const [loadState, setLoadState] = useState<RecordLoadState>(() => ({
+    requestedId: recordId,
+    repository,
+    record: null,
+    loading: true,
+    error: null,
+  }));
 
   const reload = useCallback(async () => {
+    const request = latestRequest.current + 1;
+    latestRequest.current = request;
     if (recordId.trim() === '') {
-      setRecord(null);
-      setError(null);
-      setLoading(false);
+      setLoadState({ requestedId: recordId, repository, record: null, loading: false, error: null });
       return;
     }
 
-    setLoading(true);
-    setError(null);
+    setLoadState({ requestedId: recordId, repository, record: null, loading: true, error: null });
     try {
-      setRecord(await repository.get(recordId));
+      const record = await repository.get(recordId);
+      if (latestRequest.current === request) {
+        setLoadState({ requestedId: recordId, repository, record, loading: false, error: null });
+      }
     } catch {
-      setError(loadErrorMessage);
-    } finally {
-      setLoading(false);
+      if (latestRequest.current === request) {
+        setLoadState({
+          requestedId: recordId,
+          repository,
+          record: null,
+          loading: false,
+          error: loadErrorMessage,
+        });
+      }
     }
   }, [recordId, repository]);
 
@@ -41,24 +63,30 @@ export default function EditRecordRoute() {
     void reload();
   }, [reload]);
 
-  if (loading && record === null) {
+  const currentLoadState = loadState.requestedId === recordId && loadState.repository === repository
+    ? loadState
+    : { requestedId: recordId, repository, record: null, loading: true, error: null };
+
+  if (currentLoadState.loading) {
     return <Text style={styles.status}>正在读取记录…</Text>;
   }
 
-  if (error !== null && record === null) {
+  if (currentLoadState.error !== null) {
     return <RetryState onRetry={reload} />;
   }
 
-  if (record === null) {
+  if (currentLoadState.record === null) {
     return <Text style={styles.status}>记录不存在</Text>;
   }
+
+  const record = currentLoadState.record;
 
   return (
     <RecordEditor
       initialValue={toRecordDraft(record)}
       onSubmit={async (draft) => {
-        await repository.update(record.id, toNewRecordInput(draft));
-        router.replace(`/record/${record.id}` as Href);
+        await repository.update(recordId, toNewRecordInput(draft));
+        router.replace(`/record/${recordId}` as Href);
       }}
       type={record.type}
     />
