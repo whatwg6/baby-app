@@ -54,4 +54,4 @@ npx expo export --platform android --output-dir dist/android
 
 恢复前会校验归档路径、大小、版本、哈希和 SQLite 完整性。损坏或不兼容的备份不会覆盖现有数据；替换失败会尝试从 rollback 副本恢复。
 
-如果 rollback 也无法安全完成，App 会进入“本地数据恢复不完整，数据库已保持关闭”的阻塞状态，移除全部 repository 服务且不提供重试按钮，避免用不完整文件重新打开数据库。此时应保留 App 私有数据并进行受控恢复，不能通过反复启动来绕过该状态。
+如果 rollback 也无法安全完成，App 会先在 Documents 中写入独立于 SQLite、WAL 和 SHM 文件集的 recovery sentinel，再进入“本地数据恢复不完整，数据库已保持关闭”的阻塞状态，移除全部 repository 服务且不提供重试按钮。每次启动和重开数据库前都会检查该 sentinel，因此反复启动不能绕过阻塞。此时应保留 App 私有数据并进行受控恢复；只有人工或支持人员确认 SQLite、WAL 和 SHM 已形成一致文件集后，才可以移除 sentinel，不能先删 sentinel 再尝试打开数据库。

@@ -4,7 +4,10 @@ jest.mock('expo-sqlite', () => ({
   openDatabaseAsync: jest.fn(),
 }));
 
-import { createDatabaseManager } from '../database';
+import {
+  createDatabaseManager,
+  type RecoverySentinelStore,
+} from '../database';
 import { migrateDatabase } from '../migrations';
 
 interface MigrationDatabaseOptions {
@@ -97,6 +100,26 @@ class MigrationDatabase {
       throw this.options.closeError;
     }
   }
+}
+
+class MemoryRecoverySentinelStore implements RecoverySentinelStore {
+  required = false;
+  readError: Error | null = null;
+  writeError: Error | null = null;
+
+  isRecoveryRequired = jest.fn(() => {
+    if (this.readError !== null) {
+      throw this.readError;
+    }
+    return this.required;
+  });
+
+  markRecoveryRequired = jest.fn(() => {
+    if (this.writeError !== null) {
+      throw this.writeError;
+    }
+    this.required = true;
+  });
 }
 
 function asSQLiteDatabase(database: MigrationDatabase): SQLiteDatabase {
@@ -310,6 +333,70 @@ describe('DatabaseManager.withClosedDatabase', () => {
     expect(manager.getLifecycleSnapshot()).toMatchObject({
       status: 'recovery-required',
     });
+    await expect(manager.initialize()).rejects.toMatchObject({
+      name: 'DatabaseRecoveryRequiredError',
+    });
+    expect(openDatabase).toHaveBeenCalledTimes(1);
+  });
+
+  test('blocks a fresh manager after another manager persists recovery-required', async () => {
+    const store = new MemoryRecoverySentinelStore();
+    const first = new MigrationDatabase();
+    const firstOpen = jest.fn(async () => asSQLiteDatabase(first));
+    const managerA = createDatabaseManager('baby-growth.db', firstOpen, store);
+
+    await expect(managerA.withClosedDatabase(async () => {
+      throw managerA.markRecoveryRequired(new Error('unsafe rollback'));
+    })).rejects.toMatchObject({ name: 'DatabaseRecoveryRequiredError' });
+
+    const secondOpen = jest.fn(async () => asSQLiteDatabase(new MigrationDatabase()));
+    const managerB = createDatabaseManager('baby-growth.db', secondOpen, store);
+    await expect(managerB.initialize()).rejects.toMatchObject({
+      name: 'DatabaseRecoveryRequiredError',
+    });
+
+    expect(store.required).toBe(true);
+    expect(store.markRecoveryRequired).toHaveBeenCalledTimes(1);
+    expect(secondOpen).not.toHaveBeenCalled();
+    expect(managerB.getLifecycleSnapshot()).toMatchObject({ status: 'recovery-required' });
+  });
+
+  test('fails closed before opening when the recovery sentinel cannot be read', async () => {
+    const store = new MemoryRecoverySentinelStore();
+    store.readError = new Error('sentinel read failed');
+    const openDatabase = jest.fn(async () => asSQLiteDatabase(new MigrationDatabase()));
+    const manager = createDatabaseManager('baby-growth.db', openDatabase, store);
+
+    await expect(manager.initialize()).rejects.toMatchObject({
+      name: 'DatabaseRecoveryRequiredError',
+      cause: store.readError,
+    });
+
+    expect(openDatabase).not.toHaveBeenCalled();
+    expect(manager.getLifecycleSnapshot()).toMatchObject({ status: 'recovery-required' });
+    await expect(manager.reopen()).rejects.toMatchObject({
+      name: 'DatabaseRecoveryRequiredError',
+    });
+    expect(openDatabase).not.toHaveBeenCalled();
+  });
+
+  test('fails closed without reopening when the recovery sentinel cannot be written', async () => {
+    const store = new MemoryRecoverySentinelStore();
+    store.writeError = new Error('sentinel write failed');
+    const first = new MigrationDatabase();
+    const openDatabase = jest.fn(async () => asSQLiteDatabase(first));
+    const manager = createDatabaseManager('baby-growth.db', openDatabase, store);
+
+    await expect(manager.withClosedDatabase(async () => {
+      throw manager.markRecoveryRequired(new Error('unsafe rollback'));
+    })).rejects.toMatchObject({
+      name: 'DatabaseRecoveryRequiredError',
+      cause: expect.objectContaining({ name: 'AggregateError' }),
+    });
+
+    expect(store.markRecoveryRequired).toHaveBeenCalledTimes(1);
+    expect(openDatabase).toHaveBeenCalledTimes(1);
+    expect(manager.getLifecycleSnapshot()).toMatchObject({ status: 'recovery-required' });
     await expect(manager.initialize()).rejects.toMatchObject({
       name: 'DatabaseRecoveryRequiredError',
     });

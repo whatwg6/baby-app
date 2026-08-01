@@ -2,7 +2,10 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-
 import type { SQLiteDatabase } from 'expo-sqlite';
 
 import { DatabaseRoot } from '../../app/_layout';
-import { createDatabaseManager } from '../data/database';
+import {
+  createDatabaseManager,
+  type RecoverySentinelStore,
+} from '../data/database';
 import type { SQLiteRepositories } from '../data/repositories';
 import type { AppMediaStorage } from '../app/initializeApp';
 import { MemoryBabyRepository, MemoryRecordRepository } from '../test/memoryRepositories';
@@ -114,13 +117,20 @@ test('removes stale providers while closed and installs fresh repositories befor
 });
 
 test('renders a blocking recovery state without reopening partial files', async () => {
+  let recoveryRequired = false;
+  const recoveryStore: RecoverySentinelStore = {
+    isRecoveryRequired: jest.fn(() => recoveryRequired),
+    markRecoveryRequired: jest.fn(() => {
+      recoveryRequired = true;
+    }),
+  };
   const first = new LayoutDatabase();
   const openDatabase = jest
     .fn<Promise<SQLiteDatabase>, [string]>()
     .mockResolvedValueOnce(asSQLiteDatabase(first));
-  const database = createDatabaseManager('baby-growth.db', openDatabase);
+  const database = createDatabaseManager('baby-growth.db', openDatabase, recoveryStore);
 
-  await render(
+  const mounted = await render(
     <DatabaseRoot
       cleanupMedia={jest.fn(async () => undefined)}
       database={database}
@@ -142,6 +152,33 @@ test('renders a blocking recovery state without reopening partial files', async 
   expect(await screen.findByText('本地数据恢复不完整，数据库已保持关闭')).toBeTruthy();
   expect(screen.queryByRole('button', { name: '重试' })).toBeNull();
   expect(openDatabase).toHaveBeenCalledTimes(1);
+  expect(recoveryStore.markRecoveryRequired).toHaveBeenCalledTimes(1);
+
+  await act(async () => {
+    mounted.unmount();
+  });
+  const restartedOpen = jest.fn(async () => asSQLiteDatabase(new LayoutDatabase()));
+  const restartedDatabase = createDatabaseManager(
+    'baby-growth.db',
+    restartedOpen,
+    recoveryStore,
+  );
+  await render(
+    <DatabaseRoot
+      cleanupMedia={jest.fn(async () => undefined)}
+      database={restartedDatabase}
+      mediaStorage={mediaStorage}
+      repositoryFactory={() => ({
+        babies: new MemoryBabyRepository(),
+        records: new MemoryRecordRepository(),
+      })}
+    />,
+  );
+
+  expect(await screen.findByText('本地数据恢复不完整，数据库已保持关闭')).toBeTruthy();
+  expect(screen.queryByRole('button', { name: '重试' })).toBeNull();
+  expect(screen.queryByText('app-ready')).toBeNull();
+  expect(restartedOpen).not.toHaveBeenCalled();
 });
 
 test('keeps business routes unmounted when migration fails and retries initialization', async () => {

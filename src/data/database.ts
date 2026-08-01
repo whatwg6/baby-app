@@ -11,6 +11,11 @@ export interface DatabaseManager {
   subscribe(listener: () => void): () => void;
 }
 
+export interface RecoverySentinelStore {
+  isRecoveryRequired(): boolean;
+  markRecoveryRequired(): void;
+}
+
 export type DatabaseLifecycleSnapshot =
   | { status: 'closed' }
   | { status: 'opening' }
@@ -41,6 +46,7 @@ class ExpoDatabaseManager implements DatabaseManager {
   constructor(
     private readonly databaseName: string,
     private readonly openDatabase: OpenDatabase,
+    private readonly recoverySentinel: RecoverySentinelStore,
   ) {}
 
   async initialize(): Promise<SQLiteDatabase> {
@@ -52,7 +58,7 @@ class ExpoDatabaseManager implements DatabaseManager {
   }
 
   markRecoveryRequired(cause: unknown): DatabaseRecoveryRequiredError {
-    const error = cause instanceof DatabaseRecoveryRequiredError
+    let error = cause instanceof DatabaseRecoveryRequiredError
       ? cause
       : new DatabaseRecoveryRequiredError(
         'Local data recovery is required before the database can be reopened.',
@@ -60,6 +66,18 @@ class ExpoDatabaseManager implements DatabaseManager {
       );
     this.recoveryRequired = error;
     this.database = null;
+    try {
+      this.recoverySentinel.markRecoveryRequired();
+    } catch (sentinelError) {
+      error = new DatabaseRecoveryRequiredError(
+        'Local data recovery is required, but its persistent sentinel could not be written.',
+        new AggregateError(
+          [cause, sentinelError],
+          'Recovery is required and sentinel persistence failed.',
+        ),
+      );
+      this.recoveryRequired = error;
+    }
     this.publish({ status: 'recovery-required', error });
     return error;
   }
@@ -144,6 +162,21 @@ class ExpoDatabaseManager implements DatabaseManager {
     if (this.recoveryRequired !== null) {
       throw this.recoveryRequired;
     }
+    let sentinelRequired: boolean;
+    try {
+      sentinelRequired = this.recoverySentinel.isRecoveryRequired();
+    } catch (cause) {
+      throw this.latchRecoveryRequired(new DatabaseRecoveryRequiredError(
+        'Local data recovery status could not be read; the database will remain closed.',
+        cause,
+      ));
+    }
+    if (sentinelRequired) {
+      throw this.latchRecoveryRequired(new DatabaseRecoveryRequiredError(
+        'Local data recovery is required before the database can be reopened.',
+        new Error('Persistent recovery sentinel is present.'),
+      ));
+    }
     if (this.database !== null) {
       return this.database;
     }
@@ -190,6 +223,15 @@ class ExpoDatabaseManager implements DatabaseManager {
     }
   }
 
+  private latchRecoveryRequired(
+    error: DatabaseRecoveryRequiredError,
+  ): DatabaseRecoveryRequiredError {
+    this.recoveryRequired = error;
+    this.database = null;
+    this.publish({ status: 'recovery-required', error });
+    return error;
+  }
+
   private publish(snapshot: DatabaseLifecycleSnapshot): void {
     this.lifecycleSnapshot = snapshot;
     for (const listener of this.listeners) {
@@ -219,6 +261,17 @@ class ExpoDatabaseManager implements DatabaseManager {
 export function createDatabaseManager(
   databaseName = 'baby-growth-timeline.db',
   openDatabase: OpenDatabase = openDatabaseAsync,
+  recoverySentinel: RecoverySentinelStore = createMemoryRecoverySentinelStore(),
 ): DatabaseManager {
-  return new ExpoDatabaseManager(databaseName, openDatabase);
+  return new ExpoDatabaseManager(databaseName, openDatabase, recoverySentinel);
+}
+
+function createMemoryRecoverySentinelStore(): RecoverySentinelStore {
+  let required = false;
+  return {
+    isRecoveryRequired: () => required,
+    markRecoveryRequired: () => {
+      required = true;
+    },
+  };
 }

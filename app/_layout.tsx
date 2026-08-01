@@ -10,6 +10,7 @@ import {
   type AppMediaStorage,
 } from '../src/app/initializeApp';
 import { createDatabaseManager, type DatabaseManager } from '../src/data/database';
+import { createExpoRecoverySentinelStore } from '../src/data/recoverySentinel';
 import { createSQLiteRepositories, type SQLiteRepositories } from '../src/data/repositories';
 import { mediaService, removeUnreferencedMedia, type MediaService } from '../src/features/media/mediaService';
 import { colors, spacing } from '../src/ui/theme';
@@ -21,8 +22,14 @@ type BootstrapState =
   | { status: 'recovery-required' };
 
 export default function RootLayout() {
+  const recoverySentinelRef = useRef<ReturnType<typeof createExpoRecoverySentinelStore> | null>(null);
   const databaseRef = useRef<DatabaseManager | null>(null);
-  databaseRef.current ??= createDatabaseManager();
+  recoverySentinelRef.current ??= createExpoRecoverySentinelStore();
+  databaseRef.current ??= createDatabaseManager(
+    'baby-growth-timeline.db',
+    undefined,
+    recoverySentinelRef.current,
+  );
   return <DatabaseRoot database={databaseRef.current} />;
 }
 
