@@ -3,25 +3,26 @@ import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { Stack } from 'expo-router';
 
 import { createDatabaseManager } from '../src/data/database';
-import { createSQLiteRepositories, type BabyRepository } from '../src/data/repositories';
+import { createSQLiteRepositories, type SQLiteRepositories } from '../src/data/repositories';
 import { BabyRepositoryProvider } from '../src/features/baby/useBaby';
+import { RecordRepositoryProvider } from '../src/features/records/RecordRepositoryProvider';
 import { colors, spacing } from '../src/ui/theme';
 
 export default function RootLayout() {
-  const [repository, setRepository] = useState<BabyRepository | null>(null);
+  const [repositories, setRepositories] = useState<SQLiteRepositories | null>(null);
   const [failed, setFailed] = useState(false);
   const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     let active = true;
-    setRepository(null);
+    setRepositories(null);
     setFailed(false);
 
     void createDatabaseManager()
       .initialize()
       .then((database) => {
         if (active) {
-          setRepository(createSQLiteRepositories(database).babies);
+          setRepositories(createSQLiteRepositories(database));
         }
       })
       .catch(() => {
@@ -35,7 +36,7 @@ export default function RootLayout() {
     };
   }, [attempt]);
 
-  if (repository === null) {
+  if (repositories === null) {
     return (
       <View style={styles.startup}>
         <Text style={styles.startupText}>{failed ? '无法打开本地数据' : '正在准备宝宝成长记录…'}</Text>
@@ -49,8 +50,10 @@ export default function RootLayout() {
   }
 
   return (
-    <BabyRepositoryProvider repository={repository}>
-      <Stack screenOptions={{ headerShown: false }} />
+    <BabyRepositoryProvider repository={repositories.babies}>
+      <RecordRepositoryProvider repository={repositories.records}>
+        <Stack screenOptions={{ headerShown: false }} />
+      </RecordRepositoryProvider>
     </BabyRepositoryProvider>
   );
 }

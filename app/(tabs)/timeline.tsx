@@ -1,15 +1,49 @@
 import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { useRouter, type Href } from 'expo-router';
 
-import { colors, radius, spacing } from '../../src/ui/theme';
+import TimelineFeatureScreen from '../../src/features/timeline/TimelineScreen';
+import { useBaby } from '../../src/features/baby/useBaby';
+import { useRecordRepository } from '../../src/features/records/RecordRepositoryProvider';
+import { colors, spacing } from '../../src/ui/theme';
 
 export default function TimelineScreen() {
+  const repository = useRecordRepository();
+  const router = useRouter();
+  const { baby, error, loading, reload } = useBaby();
+
+  if (loading) {
+    return (
+      <View style={styles.container}>
+        <Text style={styles.status}>正在读取宝宝资料…</Text>
+      </View>
+    );
+  }
+
+  if (error !== null) {
+    return (
+      <View style={styles.container}>
+        <Text style={styles.status}>暂时无法读取宝宝资料</Text>
+        <Pressable accessibilityRole="button" onPress={() => void reload().catch(() => undefined)}>
+          <Text style={styles.retry}>重试</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
+  if (baby === null) {
+    return (
+      <View style={styles.container}>
+        <Text style={styles.status}>请先完成宝宝资料</Text>
+      </View>
+    );
+  }
+
   return (
-    <View style={styles.container}>
-      <Text style={styles.title}>还没有成长记录</Text>
-      <Pressable style={styles.action} accessibilityRole="button">
-        <Text style={styles.actionText}>记录第一个瞬间</Text>
-      </Pressable>
-    </View>
+    <TimelineFeatureScreen
+      repository={repository}
+      baby={baby}
+      onRecordPress={(record) => router.push(`/record/${record.id}` as Href)}
+    />
   );
 }
 
@@ -18,23 +52,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: colors.background,
     flex: 1,
+    gap: spacing.md,
     justifyContent: 'center',
     padding: spacing.lg,
   },
-  title: {
-    color: colors.muted,
-    fontSize: 18,
-    marginBottom: spacing.md,
-  },
-  action: {
-    backgroundColor: colors.accent,
-    borderRadius: radius.md,
-    paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.md,
-  },
-  actionText: {
-    color: colors.card,
-    fontSize: 16,
-    fontWeight: '600',
-  },
+  status: { color: colors.muted, fontSize: 16 },
+  retry: { color: colors.accent, fontSize: 16, fontWeight: '700' },
 });

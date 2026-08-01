@@ -1,15 +1,27 @@
-import { render, screen } from '@testing-library/react-native';
+import { render, screen, waitFor } from '@testing-library/react-native';
 
 import AddScreen from '../../app/(tabs)/add';
 import BabyScreen from '../../app/(tabs)/baby';
 import TimelineScreen from '../../app/(tabs)/timeline';
 import { BabyRepositoryProvider } from '../features/baby/useBaby';
-import { MemoryBabyRepository } from '../test/memoryRepositories';
+import { RecordRepositoryProvider } from '../features/records/RecordRepositoryProvider';
+import { babyInputFixture } from '../test/fixtures';
+import { MemoryBabyRepository, MemoryRecordRepository } from '../test/memoryRepositories';
 
 test('shows the empty timeline action', async () => {
-  await render(<TimelineScreen />);
+  const babyRepository = new MemoryBabyRepository();
+  await babyRepository.save(babyInputFixture());
+  const recordRepository = new MemoryRecordRepository();
 
-  expect(screen.getByText('还没有成长记录')).toBeTruthy();
+  await render(
+    <BabyRepositoryProvider repository={babyRepository}>
+      <RecordRepositoryProvider repository={recordRepository}>
+        <TimelineScreen />
+      </RecordRepositoryProvider>
+    </BabyRepositoryProvider>,
+  );
+
+  await waitFor(() => expect(screen.getByText('还没有成长记录')).toBeTruthy());
   expect(screen.getByText('记录第一个瞬间')).toBeTruthy();
 });
 
