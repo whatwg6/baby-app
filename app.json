@@ -5,7 +5,12 @@
     "version": "1.0.0",
     "scheme": "babygrowth",
     "plugins": [
-      "expo-router",
+      [
+        "expo-router",
+        {
+          "root": "app"
+        }
+      ],
       "expo-image-picker",
       "expo-document-picker"
     ],

@@ -8,7 +8,7 @@
     "ios": "expo run:ios",
     "android": "expo run:android",
     "typecheck": "tsc --noEmit",
-    "test": "jest --runInBand"
+    "test": "node scripts/run-jest.cjs"
   },
   "dependencies": {
     "@noble/hashes": "^1.8.0",

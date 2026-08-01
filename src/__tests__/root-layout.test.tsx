@@ -1,9 +1,10 @@
-import { act, render, screen, waitFor } from '@testing-library/react-native';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import type { SQLiteDatabase } from 'expo-sqlite';
 
 import { DatabaseRoot } from '../../app/_layout';
 import { createDatabaseManager } from '../data/database';
 import type { SQLiteRepositories } from '../data/repositories';
+import type { AppMediaStorage } from '../app/initializeApp';
 import { MemoryBabyRepository, MemoryRecordRepository } from '../test/memoryRepositories';
 
 jest.mock('expo-sqlite', () => ({
@@ -12,14 +13,25 @@ jest.mock('expo-sqlite', () => ({
 
 jest.mock('expo-router', () => {
   const { Text } = require('react-native') as typeof import('react-native');
-  return { Stack: () => <Text>app-ready</Text> };
+  return {
+    Stack: () => {
+      const { useAppServices } = require('../app/AppProvider') as typeof import('../app/AppProvider');
+      const services = useAppServices();
+      return <Text>{services.database === undefined ? 'missing-services' : 'app-ready'}</Text>;
+    },
+  };
 });
+
+const mediaStorage: AppMediaStorage = {
+  ensureDirectories: jest.fn(async () => undefined),
+  clearStaging: jest.fn(async () => undefined),
+};
 
 class LayoutDatabase {
   readonly databasePath = '/documents/baby-growth.db';
   closed = false;
 
-  async execAsync(): Promise<void> {}
+  async execAsync(_sql?: string): Promise<void> {}
 
   async getFirstAsync<T>(): Promise<T> {
     return { user_version: 1 } as T;
@@ -55,6 +67,7 @@ test('removes stale providers while closed and installs fresh repositories befor
     <DatabaseRoot
       cleanupMedia={jest.fn(async () => undefined)}
       database={database}
+      mediaStorage={mediaStorage}
       repositoryFactory={repositoryFactory}
     />,
   );
@@ -111,6 +124,7 @@ test('renders a blocking recovery state without reopening partial files', async 
     <DatabaseRoot
       cleanupMedia={jest.fn(async () => undefined)}
       database={database}
+      mediaStorage={mediaStorage}
       repositoryFactory={() => ({
         babies: new MemoryBabyRepository(),
         records: new MemoryRecordRepository(),
@@ -128,4 +142,42 @@ test('renders a blocking recovery state without reopening partial files', async 
   expect(await screen.findByText('本地数据恢复不完整，数据库已保持关闭')).toBeTruthy();
   expect(screen.queryByRole('button', { name: '重试' })).toBeNull();
   expect(openDatabase).toHaveBeenCalledTimes(1);
+});
+
+test('keeps business routes unmounted when migration fails and retries initialization', async () => {
+  const failed = new LayoutDatabase();
+  failed.execAsync = async (sql?: string) => {
+    if (sql === 'PRAGMA foreign_keys = ON;') {
+      throw new Error('migration failed');
+    }
+  };
+  const reopened = new LayoutDatabase();
+  const openDatabase = jest
+    .fn<Promise<SQLiteDatabase>, [string]>()
+    .mockResolvedValueOnce(asSQLiteDatabase(failed))
+    .mockResolvedValueOnce(asSQLiteDatabase(reopened));
+  const database = createDatabaseManager('baby-growth.db', openDatabase);
+
+  await render(
+    <DatabaseRoot
+      cleanupMedia={jest.fn(async () => undefined)}
+      database={database}
+      mediaStorage={mediaStorage}
+      repositoryFactory={() => ({
+        babies: new MemoryBabyRepository(),
+        records: new MemoryRecordRepository(),
+      })}
+    />,
+  );
+
+  expect(await screen.findByText('无法打开本地数据')).toBeTruthy();
+  expect(screen.queryByText('app-ready')).toBeNull();
+  expect(failed.closed).toBe(true);
+
+  await act(async () => {
+    fireEvent.press(screen.getByRole('button', { name: '重试' }));
+  });
+
+  expect(await screen.findByText('app-ready')).toBeTruthy();
+  expect(openDatabase).toHaveBeenCalledTimes(2);
 });
