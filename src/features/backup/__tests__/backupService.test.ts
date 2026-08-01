@@ -1,13 +1,18 @@
 import type { BabyRepository, RecordRepository } from '../../../data/repositories';
-import type { DatabaseManager } from '../../../data/database';
+import {
+  DatabaseRecoveryRequiredError,
+  type DatabaseManager,
+} from '../../../data/database';
 import type { MediaService } from '../../media/mediaService';
 import { openDatabaseAsync, type SQLiteDatabase } from 'expo-sqlite';
 import {
   createBackupService,
   readZipCentralDirectory,
+  sha256File,
   validateSQLiteDatabaseFile,
   type BackupArchive,
   type BackupArchiveEntry,
+  type BackupFileReader,
   type BackupFileSystem,
 } from '../backupService';
 
@@ -92,6 +97,49 @@ describe('BackupService export', () => {
 
     expect(fixture.fileSystem.list('file:///cache/backup-exports')).toEqual([]);
   });
+
+  test('derives media references from the copied snapshot when live repositories mutate', async () => {
+    const fixture = createFixture();
+    fixture.fileSystem.seedFile(
+      'file:///documents/media/live-only.jpg',
+      bytes('live-only photo'),
+    );
+    jest.mocked(fixture.records.list).mockResolvedValue([{
+      id: 'record-live',
+      type: 'moment',
+      occurredAt: '2026-08-01T09:00:00.000Z',
+      note: null,
+      details: null,
+      attachments: [{
+        id: 'attachment-live',
+        recordId: 'record-live',
+        mediaType: 'image',
+        filePath: 'file:///documents/media/live-only.jpg',
+        thumbnailPath: null,
+        createdAt: '2026-08-01T09:00:00.000Z',
+      }],
+      createdAt: '2026-08-01T09:00:00.000Z',
+      updatedAt: '2026-08-01T09:00:00.000Z',
+    }]);
+    jest.mocked(fixture.babies.get).mockClear();
+    jest.mocked(fixture.records.list).mockClear();
+    let archivedManifest: { media?: Array<{ path: string }> } = {};
+    fixture.archive.zip.mockImplementation(async (sourceDirectory, targetPath) => {
+      archivedManifest = JSON.parse(await fixture.fileSystem.readText(
+        `${sourceDirectory}/manifest.json`,
+      )) as typeof archivedManifest;
+      fixture.fileSystem.seedFile(targetPath, bytes('zip'));
+    });
+
+    await fixture.service.export();
+
+    expect(archivedManifest.media).toEqual([{ path: 'media/photo.jpg', sha256: PHOTO_HASH, size: PHOTO.length }]);
+    expect(fixture.readSnapshotMediaPaths).toHaveBeenCalledWith(expect.stringMatching(
+      /backup-work\/export-restore-id\/database\/app\.db$/,
+    ));
+    expect(fixture.babies.get).not.toHaveBeenCalled();
+    expect(fixture.records.list).not.toHaveBeenCalled();
+  });
 });
 
 describe('BackupService inspection', () => {
@@ -116,12 +164,64 @@ describe('BackupService inspection', () => {
     expect(fixture.archive.unzip).not.toHaveBeenCalled();
   });
 
-  test('rejects a central/local-header filename mismatch before native extraction', () => {
+  test('rejects a central/local-header filename mismatch before native extraction', async () => {
     const archive = zipFixture([
       { centralPath: 'manifest.json', localPath: '../manifest.json' },
     ]);
 
-    expect(() => readZipCentralDirectory(archive)).toThrow('local header');
+    await expect(readZipCentralDirectory(memoryReader(archive))).rejects.toThrow('local header');
+  });
+
+  test.each([
+    ['flags', { localFlags: 0, centralFlags: 0x0800 }],
+    ['compression method', { localMethod: 8, centralMethod: 0 }],
+    ['CRC', { localCrc: 1, centralCrc: 0 }],
+    ['compressed size', { localCompressedSize: 1, centralCompressedSize: 0 }],
+    ['uncompressed size', { localUncompressedSize: 1, centralUncompressedSize: 0 }],
+  ])('rejects local/central %s disagreement before native extraction', async (reason, fields) => {
+    const archive = zipFixture([{
+      centralPath: 'manifest.json',
+      localPath: 'manifest.json',
+      ...fields,
+    }]);
+
+    await expect(readZipCentralDirectory(memoryReader(archive))).rejects.toThrow(reason);
+  });
+
+  test.each([
+    ['central', { centralExtra: [0x01, 0x00, 0x00, 0x00] }],
+    ['local', { localExtra: [0x01, 0x00, 0x00, 0x00] }],
+    ['central sentinel', { centralCompressedSize: 0xffffffff }],
+    ['local sentinel', { localCompressedSize: 0xffffffff }],
+  ])('rejects ZIP64 data in the %s header', async (_label, fields) => {
+    const archive = zipFixture([{
+      centralPath: 'manifest.json',
+      localPath: 'manifest.json',
+      ...fields,
+    }]);
+
+    await expect(readZipCentralDirectory(memoryReader(archive))).rejects.toThrow('ZIP64');
+  });
+
+  test('rejects a truncated ZIP extra field before native extraction', async () => {
+    const archive = zipFixture([{
+      centralPath: 'manifest.json',
+      localPath: 'manifest.json',
+      centralExtra: [0x02, 0x00, 0x08, 0x00],
+    }]);
+
+    await expect(readZipCentralDirectory(memoryReader(archive))).rejects.toThrow('extra field');
+  });
+
+  test('parses a sparse large archive using bounded random-access reads', async () => {
+    const { reader, readLengths } = sparseZipReader(64 * 1024 * 1024);
+
+    await expect(readZipCentralDirectory(reader)).resolves.toEqual([
+      expect.objectContaining({ path: 'manifest.json' }),
+    ]);
+
+    expect(Math.max(...readLengths)).toBeLessThanOrEqual(65_557);
+    expect(readLengths).not.toContain(reader.size);
   });
 
   test('rejects duplicate names and symbolic links before native extraction', async () => {
@@ -207,6 +307,21 @@ describe('BackupService inspection', () => {
 });
 
 describe('BackupService restore', () => {
+  test('removes a registered media candidate when copying its first payload fails', async () => {
+    const fixture = createFixture();
+    fixture.fileSystem.failCopyTo(
+      'file:///documents/media.restore-restore-id/photo.jpg',
+      new Error('media copy failed'),
+    );
+
+    await expect(fixture.service.restore('file:///picker/valid.zip')).rejects.toThrow(
+      'media copy failed',
+    );
+
+    expect(fixture.fileSystem.exists('file:///documents/media.restore-restore-id')).toBe(false);
+    expect(fixture.database.withClosedDatabase).not.toHaveBeenCalled();
+  });
+
   test('validates the complete archive before replacing the closed database and media', async () => {
     const fixture = createFixture();
     fixture.fileSystem.seedFile('/sqlite/app.db-wal', bytes('old wal'));
@@ -265,12 +380,69 @@ describe('BackupService restore', () => {
     fixture.fileSystem.failMoveFromMatching(/app\.db\.rollback-restore-id$/, new Error('database rollback failed'));
 
     await expect(fixture.service.restore('file:///picker/valid.zip')).rejects.toMatchObject({
+      name: 'DatabaseRecoveryRequiredError',
+    });
+    expect(fixture.database.markRecoveryRequired).toHaveBeenCalledWith(expect.objectContaining({
       name: 'AggregateError',
       errors: expect.arrayContaining([
         expect.objectContaining({ message: 'install media failed' }),
         expect.objectContaining({ message: 'database rollback failed' }),
       ]),
+    }));
+    expect(fixture.events).not.toContain('database-reopen');
+    expect(fixture.database.reopen).not.toHaveBeenCalled();
+  });
+
+  test('removes candidate sidecars and restores old sidecars before reopening after a failed candidate open', async () => {
+    const fixture = createFixture({
+      automaticReopenFailure: new Error('restored database failed to open'),
+      createCandidateSidecars: true,
     });
+    fixture.fileSystem.seedFile('/sqlite/app.db-wal', bytes('old wal'));
+    fixture.fileSystem.seedFile('/sqlite/app.db-shm', bytes('old shm'));
+
+    await expect(fixture.service.restore('file:///picker/valid.zip')).rejects.toThrow(
+      'restored database failed to open',
+    );
+
+    await expect(fixture.fileSystem.readBytes('/sqlite/app.db')).resolves.toEqual(OLD_DATABASE);
+    await expect(fixture.fileSystem.readBytes('/sqlite/app.db-wal')).resolves.toEqual(bytes('old wal'));
+    await expect(fixture.fileSystem.readBytes('/sqlite/app.db-shm')).resolves.toEqual(bytes('old shm'));
+    expect(fixture.database.reopen).toHaveBeenCalledTimes(1);
+  });
+
+  test('removes candidate sidecars when the old database had no sidecars before reopening', async () => {
+    const fixture = createFixture({
+      automaticReopenFailure: new Error('restored database failed to open'),
+      createCandidateSidecars: true,
+    });
+
+    await expect(fixture.service.restore('file:///picker/valid.zip')).rejects.toThrow(
+      'restored database failed to open',
+    );
+
+    await expect(fixture.fileSystem.readBytes('/sqlite/app.db')).resolves.toEqual(OLD_DATABASE);
+    expect(fixture.fileSystem.exists('/sqlite/app.db-wal')).toBe(false);
+    expect(fixture.fileSystem.exists('/sqlite/app.db-shm')).toBe(false);
+    expect(fixture.database.reopen).toHaveBeenCalledTimes(1);
+  });
+
+  test('keeps the database closed when a retired old sidecar rollback copy is missing', async () => {
+    const fixture = createFixture({
+      automaticReopenFailure: new Error('restored database failed to open'),
+      createCandidateSidecars: true,
+      dropWalRollbackBeforeFailure: true,
+    });
+    fixture.fileSystem.seedFile('/sqlite/app.db-wal', bytes('old wal'));
+    fixture.fileSystem.seedFile('/sqlite/app.db-shm', bytes('old shm'));
+
+    await expect(fixture.service.restore('file:///picker/valid.zip')).rejects.toMatchObject({
+      name: 'DatabaseRecoveryRequiredError',
+    });
+
+    expect(fixture.database.markRecoveryRequired).toHaveBeenCalled();
+    expect(fixture.database.reopen).not.toHaveBeenCalled();
+    expect(fixture.fileSystem.exists('/sqlite/app.db-wal')).toBe(false);
   });
 });
 
@@ -312,6 +484,37 @@ describe('BackupService clear', () => {
     await expect(fixture.service.clear()).resolves.toMatchObject({ cleanupPending: false });
     expect(fixture.media.remove).toHaveBeenCalledWith(['file:///outside/photo.jpg']);
   });
+
+  test('removes sidecars created by a failed empty-database open before restoring and reopening', async () => {
+    const fixture = createFixture({
+      automaticReopenFailure: new Error('empty database failed to open'),
+      createCandidateSidecars: true,
+    });
+
+    await expect(fixture.service.clear()).rejects.toThrow('empty database failed to open');
+
+    await expect(fixture.fileSystem.readBytes('/sqlite/app.db')).resolves.toEqual(OLD_DATABASE);
+    expect(fixture.fileSystem.exists('/sqlite/app.db-wal')).toBe(false);
+    expect(fixture.fileSystem.exists('/sqlite/app.db-shm')).toBe(false);
+    expect(fixture.database.reopen).toHaveBeenCalledTimes(1);
+  });
+
+  test('keeps the database closed when clear rollback cannot restore a complete file set', async () => {
+    const fixture = createFixture({
+      automaticReopenFailure: new Error('empty database failed to open'),
+      createCandidateSidecars: true,
+    });
+    fixture.fileSystem.failMoveFromMatching(
+      /app\.db\.rollback-clear-restore-id$/,
+      new Error('old database restore failed'),
+    );
+
+    await expect(fixture.service.clear()).rejects.toMatchObject({
+      name: 'DatabaseRecoveryRequiredError',
+    });
+    expect(fixture.database.markRecoveryRequired).toHaveBeenCalled();
+    expect(fixture.database.reopen).not.toHaveBeenCalled();
+  });
 });
 
 test('SQLite inspection checkpoints remapped WAL changes before closing the temporary database', async () => {
@@ -341,7 +544,39 @@ test('SQLite inspection checkpoints remapped WAL changes before closing the temp
   expect(events.indexOf('PRAGMA wal_checkpoint(TRUNCATE);')).toBeLessThan(events.indexOf('close'));
 });
 
+test('SHA-256 hashes a large payload incrementally with bounded reads', async () => {
+  const payloadSize = 2 * 1024 * 1024 + 17;
+  const readLengths: number[] = [];
+  const fullRead = jest.fn(async () => {
+    throw new Error('whole-file read is forbidden');
+  });
+  const reader: BackupFileReader = {
+    size: payloadSize,
+    read: jest.fn(async (_offset, length) => {
+      readLengths.push(length);
+      return new Uint8Array(length).fill(0x61);
+    }),
+    close: jest.fn(async () => undefined),
+  };
+  const fileSystem = {
+    openRead: jest.fn(async () => reader),
+    readBytes: fullRead,
+  } as unknown as BackupFileSystem;
+
+  await expect(sha256File('file:///large-video.mp4', fileSystem)).resolves.toBe(
+    'c2273a45bd6d19d2714b8279b1fd1123bb746e7f7f6331085fb6ecaa30164546',
+  );
+
+  expect(Math.max(...readLengths)).toBeLessThan(payloadSize);
+  expect(readLengths.reduce((total, length) => total + length, 0)).toBe(payloadSize);
+  expect(fullRead).not.toHaveBeenCalled();
+  expect(reader.close).toHaveBeenCalledTimes(1);
+});
+
 type FixtureOptions = {
+  automaticReopenFailure?: Error;
+  createCandidateSidecars?: boolean;
+  dropWalRollbackBeforeFailure?: boolean;
   manifestVersion?: number;
   mediaHash?: string;
   mediaSize?: number;
@@ -353,12 +588,33 @@ function createFixture(options: FixtureOptions = {}) {
   fileSystem.seedFile('/sqlite/app.db', OLD_DATABASE);
   fileSystem.seedFile('file:///documents/media/old.jpg', bytes('old photo'));
   fileSystem.seedFile('file:///documents/media/photo.jpg', PHOTO);
+  const markRecoveryRequired = jest.fn((cause: unknown) => new DatabaseRecoveryRequiredError(
+    'Local data recovery is required before the database can be reopened.',
+    cause,
+  ));
   const withClosedDatabase = jest.fn(async (work: (databasePath: string) => Promise<unknown>) => {
     events.push('database-close-current');
     try {
-      return await work('/sqlite/app.db');
-    } finally {
+      const result = await work('/sqlite/app.db');
+      if (options.automaticReopenFailure !== undefined) {
+        events.push('database-reopen-failed');
+        if (options.dropWalRollbackBeforeFailure === true) {
+          fileSystem.deleteNow('/sqlite/app.db-wal.rollback-restore-id');
+        }
+        if (options.createCandidateSidecars === true) {
+          fileSystem.seedFile('/sqlite/app.db-wal', bytes('candidate wal'));
+          fileSystem.seedFile('/sqlite/app.db-shm', bytes('candidate shm'));
+        }
+        throw options.automaticReopenFailure;
+      }
       events.push('database-reopen');
+      return result;
+    } catch (cause) {
+      if (!(cause instanceof DatabaseRecoveryRequiredError) &&
+          cause !== options.automaticReopenFailure) {
+        events.push('database-reopen');
+      }
+      throw cause;
     }
   });
   const database: DatabaseManager = {
@@ -368,6 +624,9 @@ function createFixture(options: FixtureOptions = {}) {
       return {} as never;
     }),
     withClosedDatabase: withClosedDatabase as DatabaseManager['withClosedDatabase'],
+    markRecoveryRequired,
+    getLifecycleSnapshot: jest.fn(() => ({ status: 'closed' })),
+    subscribe: jest.fn(() => () => undefined),
   };
   const babies: BabyRepository = {
     get: jest.fn(async () => ({
@@ -448,6 +707,9 @@ function createFixture(options: FixtureOptions = {}) {
   const validateDatabase = jest.fn(async () => {
     events.push('database-integrity');
   });
+  const readSnapshotMediaPaths = jest.fn(async () => [
+    'file:///documents/media/photo.jpg',
+  ]);
   const hashFile = jest.fn(async (path: string) => {
     const contents = text(await fileSystem.readBytes(path));
     if (contents === 'backup database') {
@@ -472,6 +734,7 @@ function createFixture(options: FixtureOptions = {}) {
     now: () => new Date('2026-08-01T12:00:00.000Z'),
     pickArchive: jest.fn(async () => 'file:///picker/valid.zip'),
     records,
+    readSnapshotMediaPaths,
     sharing,
     validateDatabase,
   });
@@ -484,6 +747,7 @@ function createFixture(options: FixtureOptions = {}) {
     fileSystem,
     media,
     records,
+    readSnapshotMediaPaths,
     service,
     sharing,
     validateDatabase,
@@ -501,6 +765,7 @@ class MemoryBackupFileSystem implements BackupFileSystem {
     '/sqlite',
   ]);
   private readonly moveToFailures = new Map<string, Error>();
+  private readonly copyToFailures = new Map<string, Error>();
   private readonly moveFromFailures: Array<{ pattern: RegExp; error: Error }> = [];
 
   availableDiskSpace = jest.fn(() => 1_000_000);
@@ -519,12 +784,23 @@ class MemoryBackupFileSystem implements BackupFileSystem {
     this.moveToFailures.set(path, error);
   }
 
+  failCopyTo(path: string, error: Error): void {
+    this.copyToFailures.set(path, error);
+  }
+
   failMoveFromMatching(pattern: RegExp, error: Error): void {
     this.moveFromFailures.push({ pattern, error });
   }
 
   exists = jest.fn((path: string) => this.files.has(path) || this.directories.has(path));
   size = jest.fn((path: string) => this.files.get(path)?.length ?? 0);
+  openRead = jest.fn(async (path: string): Promise<BackupFileReader> => {
+    const value = this.files.get(path);
+    if (value === undefined) {
+      throw new Error(`Missing file: ${path}`);
+    }
+    return memoryReader(value);
+  });
   readBytes = jest.fn(async (path: string) => {
     const value = this.files.get(path);
     if (value === undefined) {
@@ -541,7 +817,14 @@ class MemoryBackupFileSystem implements BackupFileSystem {
     this.directories.add(path);
   });
   copyFile = jest.fn(async (source: string, target: string) => {
-    this.seedFile(target, await this.readBytes(source));
+    const value = await this.readBytes(source);
+    const failure = this.copyToFailures.get(target);
+    if (failure !== undefined) {
+      this.copyToFailures.delete(target);
+      this.seedFile(target, value.subarray(0, Math.max(1, Math.floor(value.length / 2))));
+      throw failure;
+    }
+    this.seedFile(target, value);
   });
   move = jest.fn(async (source: string, target: string) => {
     const fromFailure = this.moveFromFailures.find(({ pattern }) => pattern.test(source));
@@ -637,47 +920,68 @@ function parent(path: string): string {
   return index <= 0 ? path.slice(0, Math.max(0, index)) : path.slice(0, index);
 }
 
-function zipFixture(entries: Array<{ centralPath: string; localPath: string }>): Uint8Array {
+type ZipFixtureEntry = {
+  centralPath: string;
+  localPath: string;
+  centralFlags?: number;
+  localFlags?: number;
+  centralMethod?: number;
+  localMethod?: number;
+  centralCrc?: number;
+  localCrc?: number;
+  centralCompressedSize?: number;
+  localCompressedSize?: number;
+  centralUncompressedSize?: number;
+  localUncompressedSize?: number;
+  centralExtra?: number[];
+  localExtra?: number[];
+};
+
+function zipFixture(entries: ZipFixtureEntry[]): Uint8Array {
   const chunks: number[] = [];
   const central: number[] = [];
   const offsets: number[] = [];
   for (const entry of entries) {
     offsets.push(chunks.length);
     const name = [...bytes(entry.localPath)];
+    const extra = entry.localExtra ?? [];
     pushU32(chunks, 0x04034b50);
     pushU16(chunks, 20);
-    pushU16(chunks, 0x0800);
+    pushU16(chunks, entry.localFlags ?? 0x0800);
+    pushU16(chunks, entry.localMethod ?? 0);
     pushU16(chunks, 0);
     pushU16(chunks, 0);
-    pushU16(chunks, 0);
-    pushU32(chunks, 0);
-    pushU32(chunks, 0);
-    pushU32(chunks, 0);
+    pushU32(chunks, entry.localCrc ?? 0);
+    pushU32(chunks, entry.localCompressedSize ?? 0);
+    pushU32(chunks, entry.localUncompressedSize ?? 0);
     pushU16(chunks, name.length);
-    pushU16(chunks, 0);
+    pushU16(chunks, extra.length);
     chunks.push(...name);
+    chunks.push(...extra);
   }
   const centralOffset = chunks.length;
   entries.forEach((entry, index) => {
     const name = [...bytes(entry.centralPath)];
+    const extra = entry.centralExtra ?? [];
     pushU32(central, 0x02014b50);
     pushU16(central, 20);
     pushU16(central, 20);
-    pushU16(central, 0x0800);
+    pushU16(central, entry.centralFlags ?? 0x0800);
+    pushU16(central, entry.centralMethod ?? 0);
     pushU16(central, 0);
     pushU16(central, 0);
-    pushU16(central, 0);
-    pushU32(central, 0);
-    pushU32(central, 0);
-    pushU32(central, 0);
+    pushU32(central, entry.centralCrc ?? 0);
+    pushU32(central, entry.centralCompressedSize ?? 0);
+    pushU32(central, entry.centralUncompressedSize ?? 0);
     pushU16(central, name.length);
-    pushU16(central, 0);
+    pushU16(central, extra.length);
     pushU16(central, 0);
     pushU16(central, 0);
     pushU16(central, 0);
     pushU32(central, 0);
     pushU32(central, offsets[index]);
     central.push(...name);
+    central.push(...extra);
   });
   chunks.push(...central);
   pushU32(chunks, 0x06054b50);
@@ -689,6 +993,97 @@ function zipFixture(entries: Array<{ centralPath: string; localPath: string }>):
   pushU32(chunks, centralOffset);
   pushU16(chunks, 0);
   return new Uint8Array(chunks);
+}
+
+function memoryReader(value: Uint8Array, readLengths: number[] = []): BackupFileReader {
+  return {
+    size: value.length,
+    async read(offset, length) {
+      readLengths.push(length);
+      return value.slice(offset, offset + length);
+    },
+    async close() {},
+  };
+}
+
+function sparseZipReader(centralOffset: number): {
+  reader: BackupFileReader;
+  readLengths: number[];
+} {
+  const name = [...bytes('manifest.json')];
+  const local: number[] = [];
+  pushU32(local, 0x04034b50);
+  pushU16(local, 20);
+  pushU16(local, 0x0800);
+  pushU16(local, 0);
+  pushU16(local, 0);
+  pushU16(local, 0);
+  pushU32(local, 0);
+  pushU32(local, centralOffset - 30 - name.length);
+  pushU32(local, centralOffset - 30 - name.length);
+  pushU16(local, name.length);
+  pushU16(local, 0);
+  local.push(...name);
+
+  const central: number[] = [];
+  pushU32(central, 0x02014b50);
+  pushU16(central, 20);
+  pushU16(central, 20);
+  pushU16(central, 0x0800);
+  pushU16(central, 0);
+  pushU16(central, 0);
+  pushU16(central, 0);
+  pushU32(central, 0);
+  pushU32(central, centralOffset - local.length);
+  pushU32(central, centralOffset - local.length);
+  pushU16(central, name.length);
+  pushU16(central, 0);
+  pushU16(central, 0);
+  pushU16(central, 0);
+  pushU16(central, 0);
+  pushU32(central, 0);
+  pushU32(central, 0);
+  central.push(...name);
+
+  const eocd: number[] = [];
+  pushU32(eocd, 0x06054b50);
+  pushU16(eocd, 0);
+  pushU16(eocd, 0);
+  pushU16(eocd, 1);
+  pushU16(eocd, 1);
+  pushU32(eocd, central.length);
+  pushU32(eocd, centralOffset);
+  pushU16(eocd, 0);
+
+  const segments = [
+    { offset: 0, bytes: new Uint8Array(local) },
+    { offset: centralOffset, bytes: new Uint8Array(central) },
+    { offset: centralOffset + central.length, bytes: new Uint8Array(eocd) },
+  ];
+  const size = centralOffset + central.length + eocd.length;
+  const readLengths: number[] = [];
+  return {
+    readLengths,
+    reader: {
+      size,
+      async read(offset, length) {
+        readLengths.push(length);
+        const result = new Uint8Array(length);
+        for (const segment of segments) {
+          const start = Math.max(offset, segment.offset);
+          const end = Math.min(offset + length, segment.offset + segment.bytes.length);
+          if (start < end) {
+            result.set(
+              segment.bytes.subarray(start - segment.offset, end - segment.offset),
+              start - offset,
+            );
+          }
+        }
+        return result;
+      },
+      async close() {},
+    },
+  };
 }
 
 function pushU16(target: number[], value: number): void {

@@ -11,8 +11,8 @@
     "test": "jest --runInBand"
   },
   "dependencies": {
+    "@noble/hashes": "^1.8.0",
     "expo": "^57.0.9",
-    "expo-crypto": "^57.0.1",
     "expo-dev-client": "^57.0.10",
     "expo-document-picker": "^57.0.1",
     "expo-file-system": "^57.0.1",

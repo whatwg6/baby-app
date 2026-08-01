@@ -1,4 +1,5 @@
-import { Directory, File, Paths } from 'expo-file-system';
+import { sha256 } from '@noble/hashes/sha2';
+import { Directory, File, FileMode, Paths } from 'expo-file-system';
 import type { SQLiteDatabase } from 'expo-sqlite';
 
 import type { DatabaseManager } from '../../data/database';
@@ -27,7 +28,7 @@ export interface BackupFileSystem {
   availableDiskSpace(): number;
   exists(path: string): boolean;
   size(path: string): number;
-  readBytes(path: string): Promise<Uint8Array>;
+  openRead(path: string): Promise<BackupFileReader>;
   readText(path: string): Promise<string>;
   writeText(path: string, value: string): Promise<void>;
   ensureDirectory(path: string): Promise<void>;
@@ -35,6 +36,12 @@ export interface BackupFileSystem {
   move(source: string, target: string): Promise<void>;
   delete(path: string): Promise<void>;
   list(directory: string): Array<{ path: string; modifiedAt: number }>;
+}
+
+export interface BackupFileReader {
+  readonly size: number;
+  read(offset: number, length: number): Promise<Uint8Array>;
+  close(): Promise<void>;
 }
 
 export interface BackupSharing {
@@ -94,6 +101,7 @@ type BackupServiceDependencies = {
   archive?: BackupArchive;
   sharing?: BackupSharing;
   hashFile?(path: string): Promise<string>;
+  readSnapshotMediaPaths?(databasePath: string): Promise<string[]>;
   validateDatabase?(
     databasePath: string,
     restoredMedia: ReadonlyMap<string, string>,
@@ -114,10 +122,20 @@ type Replacement = {
   databasePath: string;
   databaseRollbackPath: string;
   databaseCandidatePath: string;
+  databaseRetired: boolean;
   mediaPath: string;
   mediaRollbackPath: string;
   mediaCandidatePath: string;
-  databaseSidecars: Array<{ path: string; rollbackPath: string }>;
+  mediaExisted: boolean;
+  mediaRetired: boolean;
+  databaseSidecars: RollbackFile[];
+};
+
+type RollbackFile = {
+  path: string;
+  rollbackPath: string;
+  existed: boolean;
+  retired: boolean;
 };
 
 const EXPORT_EXPIRY_MS = 24 * 60 * 60 * 1000;
@@ -129,6 +147,7 @@ export function createBackupService(dependencies: BackupServiceDependencies): Ba
   const archive = dependencies.archive ?? createNativeArchive(fileSystem);
   const sharing = dependencies.sharing ?? nativeSharing;
   const hashFile = dependencies.hashFile ?? ((path) => sha256File(path, fileSystem));
+  const readSnapshotMediaPaths = dependencies.readSnapshotMediaPaths ?? readSQLiteMediaPaths;
   const validateDatabase = dependencies.validateDatabase ?? validateSQLiteDatabaseFile;
   const pickArchive = dependencies.pickArchive ?? pickBackupArchive;
   const createId = dependencies.createId ?? createUuid;
@@ -232,18 +251,21 @@ export function createBackupService(dependencies: BackupServiceDependencies): Ba
         await fileSystem.ensureDirectory(joinPath(operationDirectory, 'database'));
         await fileSystem.ensureDirectory(joinPath(operationDirectory, 'media'));
         await fileSystem.ensureDirectory(exportRoot);
-        const referencedMedia = await collectReferencedMedia(
-          dependencies.babies,
-          dependencies.records,
-          mediaDirectory,
-        );
-
         await dependencies.database.withClosedDatabase(async (databasePath) => {
           const snapshotPath = archiveFilePath(operationDirectory, DATABASE_ARCHIVE_PATH);
           if (!fileSystem.exists(databasePath)) {
             throw new BackupServiceError('files', '找不到当前数据库文件');
           }
           await fileSystem.copyFile(databasePath, snapshotPath);
+          const referencedMedia = mapReferencedMedia(
+            await readSnapshotMediaPaths(snapshotPath),
+            mediaDirectory,
+          );
+          for (const sidecarPath of databaseSidecarPaths(snapshotPath)) {
+            if (fileSystem.exists(sidecarPath)) {
+              await fileSystem.delete(sidecarPath);
+            }
+          }
 
           const mediaManifest: BackupManifestV1['media'] = [];
           for (const item of referencedMedia) {
@@ -352,12 +374,13 @@ export function createBackupService(dependencies: BackupServiceDependencies): Ba
       const operationDirectory = joinPath(workRoot, operationId);
       let inspection: InspectedBackup | undefined;
       let replacement: Replacement | undefined;
+      let mediaCandidatePath: string | undefined;
       let primaryError: unknown;
       let cleanupWarning: string | undefined;
       let replacementCompleted = false;
       try {
         inspection = await inspectIntoWorkDirectory(archivePath, operationId);
-        const mediaCandidatePath = `${mediaDirectory}.restore-${operationId}`;
+        mediaCandidatePath = `${mediaDirectory}.restore-${operationId}`;
         if (fileSystem.exists(mediaCandidatePath)) {
           await fileSystem.delete(mediaCandidatePath);
         }
@@ -370,7 +393,7 @@ export function createBackupService(dependencies: BackupServiceDependencies): Ba
         }
 
         await dependencies.database.withClosedDatabase(async (databasePath) => {
-          replacement = replacementPaths(databasePath, mediaDirectory, operationId);
+          replacement = replacementPaths(databasePath, mediaDirectory, operationId, fileSystem);
           try {
             await installReplacement(
               replacement,
@@ -381,10 +404,10 @@ export function createBackupService(dependencies: BackupServiceDependencies): Ba
           } catch (cause) {
             const rollbackErrors = await rollbackReplacement(replacement, fileSystem);
             if (rollbackErrors.length > 0) {
-              throw new AggregateError(
+              throw dependencies.database.markRecoveryRequired(new AggregateError(
                 [cause, ...rollbackErrors],
-                '恢复失败且旧数据回滚不完整',
-              );
+                '恢复失败且旧数据回滚不完整；数据库已保持关闭',
+              ));
             }
             throw asBackupError('replace', '替换本地数据失败，旧数据已恢复', cause);
           }
@@ -393,16 +416,20 @@ export function createBackupService(dependencies: BackupServiceDependencies): Ba
         primaryError = cause;
         if (replacementCompleted && replacement !== undefined) {
           const rollbackErrors = await rollbackReplacement(replacement, fileSystem);
-          try {
-            await dependencies.database.reopen();
-          } catch (reopenError) {
-            rollbackErrors.push(reopenError);
-          }
           if (rollbackErrors.length > 0) {
-            primaryError = new AggregateError(
+            primaryError = dependencies.database.markRecoveryRequired(new AggregateError(
               [cause, ...rollbackErrors],
-              '数据库重开失败且旧数据回滚不完整',
-            );
+              '数据库重开失败且旧数据回滚不完整；数据库已保持关闭',
+            ));
+          } else {
+            try {
+              await dependencies.database.reopen();
+            } catch (reopenError) {
+              primaryError = new AggregateError(
+                [cause, reopenError],
+                '恢复数据无法打开；旧数据已完整回滚，但数据库重开失败',
+              );
+            }
           }
         }
       }
@@ -410,6 +437,9 @@ export function createBackupService(dependencies: BackupServiceDependencies): Ba
       const cleanupTasks: Array<() => Promise<void>> = [];
       if (primaryError === undefined && replacement !== undefined) {
         cleanupTasks.push(...replacementCleanupTasks(replacement, fileSystem));
+      }
+      if (mediaCandidatePath !== undefined && fileSystem.exists(mediaCandidatePath)) {
+        cleanupTasks.push(() => fileSystem.delete(mediaCandidatePath!));
       }
       if (fileSystem.exists(operationDirectory)) {
         cleanupTasks.push(() => fileSystem.delete(operationDirectory));
@@ -435,7 +465,7 @@ export function createBackupService(dependencies: BackupServiceDependencies): Ba
       );
       let databasePath: string | undefined;
       let rollbackPath: string | undefined;
-      let sidecarRollbacks: Array<{ path: string; rollbackPath: string }> = [];
+      let sidecarRollbacks: RollbackFile[] = [];
       let databaseCleared = false;
       try {
         await dependencies.database.withClosedDatabase(async (currentDatabasePath) => {
@@ -444,41 +474,57 @@ export function createBackupService(dependencies: BackupServiceDependencies): Ba
           sidecarRollbacks = databaseSidecarPaths(currentDatabasePath).map((path) => ({
             path,
             rollbackPath: `${path}.rollback-clear-${operationId}`,
+            existed: fileSystem.exists(path),
+            retired: false,
           }));
           try {
             for (const sidecar of sidecarRollbacks) {
-              if (fileSystem.exists(sidecar.path)) {
+              if (sidecar.existed) {
                 await fileSystem.move(sidecar.path, sidecar.rollbackPath);
+                sidecar.retired = true;
               }
             }
             await fileSystem.move(currentDatabasePath, rollbackPath);
             databaseCleared = true;
           } catch (cause) {
-            const sidecarErrors = await restoreSidecarRollbacks(sidecarRollbacks, fileSystem);
-            if (sidecarErrors.length > 0) {
-              throw new AggregateError(
-                [cause, ...sidecarErrors],
-                '清空数据库失败且 SQLite 辅助文件回滚不完整',
-              );
+            const rollbackErrors = await rollbackDatabaseFileSet(
+              currentDatabasePath,
+              rollbackPath,
+              databaseCleared,
+              sidecarRollbacks,
+              fileSystem,
+            );
+            if (rollbackErrors.length > 0) {
+              throw dependencies.database.markRecoveryRequired(new AggregateError(
+                [cause, ...rollbackErrors],
+                '清空数据库失败且 SQLite 文件集回滚不完整；数据库已保持关闭',
+              ));
             }
             throw asBackupError('replace', '清空数据库失败，媒体尚未删除', cause);
           }
         });
       } catch (cause) {
         if (databaseCleared && databasePath !== undefined && rollbackPath !== undefined) {
-          const rollbackErrors = await restoreSingleRollback(
+          const rollbackErrors = await rollbackDatabaseFileSet(
             databasePath,
             rollbackPath,
+            databaseCleared,
+            sidecarRollbacks,
             fileSystem,
           );
-          rollbackErrors.push(...await restoreSidecarRollbacks(sidecarRollbacks, fileSystem, true));
+          if (rollbackErrors.length > 0) {
+            throw dependencies.database.markRecoveryRequired(new AggregateError(
+              [cause, ...rollbackErrors],
+              '清空失败且旧数据库回滚不完整；数据库已保持关闭',
+            ));
+          }
           try {
             await dependencies.database.reopen();
           } catch (reopenError) {
-            rollbackErrors.push(reopenError);
-          }
-          if (rollbackErrors.length > 0) {
-            throw new AggregateError([cause, ...rollbackErrors], '清空失败且旧数据库回滚不完整');
+            throw new AggregateError(
+              [cause, reopenError],
+              '清空失败；旧数据库已完整回滚，但数据库重开失败',
+            );
           }
         }
         throw cause;
@@ -519,17 +565,23 @@ export function createBackupService(dependencies: BackupServiceDependencies): Ba
   };
 }
 
-export function readZipCentralDirectory(bytes: Uint8Array): BackupArchiveEntry[] {
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const eocdOffset = findEndOfCentralDirectory(view);
-  const diskNumber = readU16(view, eocdOffset + 4);
-  const centralDisk = readU16(view, eocdOffset + 6);
-  const diskEntries = readU16(view, eocdOffset + 8);
-  const totalEntries = readU16(view, eocdOffset + 10);
-  const centralSize = readU32(view, eocdOffset + 12);
-  const centralOffset = readU32(view, eocdOffset + 16);
-  const commentLength = readU16(view, eocdOffset + 20);
-  if (eocdOffset + 22 + commentLength !== view.byteLength) {
+export async function readZipCentralDirectory(
+  reader: BackupFileReader,
+): Promise<BackupArchiveEntry[]> {
+  const tailLength = Math.min(reader.size, 22 + 0xffff);
+  const tailOffset = reader.size - tailLength;
+  const tail = await readExact(reader, tailOffset, tailLength, 'end record search');
+  const relativeEocdOffset = findEndOfCentralDirectory(tail);
+  const eocdOffset = tailOffset + relativeEocdOffset;
+  const eocd = tail.subarray(relativeEocdOffset);
+  const diskNumber = readU16(eocd, 4);
+  const centralDisk = readU16(eocd, 6);
+  const diskEntries = readU16(eocd, 8);
+  const totalEntries = readU16(eocd, 10);
+  const centralSize = readU32(eocd, 12);
+  const centralOffset = readU32(eocd, 16);
+  const commentLength = readU16(eocd, 20);
+  if (eocdOffset + 22 + commentLength !== reader.size) {
     throw new Error('ZIP has trailing or truncated data after its central directory.');
   }
   if (diskNumber !== 0 || centralDisk !== 0 || diskEntries !== totalEntries) {
@@ -545,20 +597,22 @@ export function readZipCentralDirectory(bytes: Uint8Array): BackupArchiveEntry[]
   const entries: BackupArchiveEntry[] = [];
   let offset = centralOffset;
   for (let index = 0; index < totalEntries; index += 1) {
-    ensureRange(view, offset, 46, 'central directory header');
-    if (readU32(view, offset) !== 0x02014b50) {
+    const header = await readExact(reader, offset, 46, 'central directory header');
+    if (readU32(header, 0) !== 0x02014b50) {
       throw new Error('ZIP central directory header is invalid.');
     }
-    const versionMadeBy = readU16(view, offset + 4);
-    const flags = readU16(view, offset + 8);
-    const compressedSize = readU32(view, offset + 20);
-    const uncompressedSize = readU32(view, offset + 24);
-    const nameLength = readU16(view, offset + 28);
-    const extraLength = readU16(view, offset + 30);
-    const entryCommentLength = readU16(view, offset + 32);
-    const startDisk = readU16(view, offset + 34);
-    const externalAttributes = readU32(view, offset + 38);
-    const localHeaderOffset = readU32(view, offset + 42);
+    const versionMadeBy = readU16(header, 4);
+    const flags = readU16(header, 8);
+    const compressionMethod = readU16(header, 10);
+    const crc = readU32(header, 16);
+    const compressedSize = readU32(header, 20);
+    const uncompressedSize = readU32(header, 24);
+    const nameLength = readU16(header, 28);
+    const extraLength = readU16(header, 30);
+    const entryCommentLength = readU16(header, 32);
+    const startDisk = readU16(header, 34);
+    const externalAttributes = readU32(header, 38);
+    const localHeaderOffset = readU32(header, 42);
     if ((flags & 0x0001) !== 0) {
       throw new Error('Encrypted ZIP entries are not supported.');
     }
@@ -566,19 +620,42 @@ export function readZipCentralDirectory(bytes: Uint8Array): BackupArchiveEntry[]
         localHeaderOffset === 0xffffffff || startDisk !== 0) {
       throw new Error('ZIP64 entries are not supported.');
     }
-    ensureRange(
-      view,
+    ensureFileRange(
+      reader.size,
       offset + 46,
       nameLength + extraLength + entryCommentLength,
       'central directory entry',
     );
-    const path = decodeZipName(bytes, offset + 46, nameLength, flags);
-    const localPath = readLocalHeaderPath(bytes, view, localHeaderOffset);
-    if (localPath !== path) {
+    const variable = await readExact(
+      reader,
+      offset + 46,
+      nameLength + extraLength,
+      'central directory name and extra field',
+    );
+    const nameBytes = variable.subarray(0, nameLength);
+    const extraBytes = variable.subarray(nameLength);
+    validateZipExtraFields(extraBytes, 'central');
+    const path = decodeZipName(nameBytes, flags);
+    const local = await readLocalHeader(reader, localHeaderOffset);
+    if (local.path !== path) {
       throw new Error('ZIP local header path does not match its central directory entry.');
     }
-    const dataStart = localHeaderDataStart(view, localHeaderOffset);
-    if (dataStart + compressedSize > centralOffset) {
+    if (local.flags !== flags) {
+      throw new Error('ZIP local header flags do not match its central directory entry.');
+    }
+    if (local.compressionMethod !== compressionMethod) {
+      throw new Error('ZIP local header compression method does not match its central directory entry.');
+    }
+    if (local.crc !== crc) {
+      throw new Error('ZIP local header CRC does not match its central directory entry.');
+    }
+    if (local.compressedSize !== compressedSize) {
+      throw new Error('ZIP local header compressed size does not match its central directory entry.');
+    }
+    if (local.uncompressedSize !== uncompressedSize) {
+      throw new Error('ZIP local header uncompressed size does not match its central directory entry.');
+    }
+    if (local.dataStart + compressedSize > centralOffset) {
       throw new Error('ZIP entry data escapes its local file area.');
     }
     const platform = versionMadeBy >>> 8;
@@ -702,12 +779,10 @@ async function verifyFile(
   }
 }
 
-async function collectReferencedMedia(
-  babies: BabyRepository,
-  records: RecordRepository,
+function mapReferencedMedia(
+  uniquePaths: string[],
   mediaDirectory: string,
-): Promise<Array<{ sourcePath: string; archivePath: string }>> {
-  const uniquePaths = await collectReferencedPaths(babies, records);
+): Array<{ sourcePath: string; archivePath: string }> {
   return uniquePaths.map((sourcePath) => {
     const prefix = `${stripTrailingSlash(mediaDirectory)}/`;
     if (!sourcePath.startsWith(prefix)) {
@@ -721,6 +796,45 @@ async function collectReferencedMedia(
     }
     return { sourcePath, archivePath };
   });
+}
+
+async function readSQLiteMediaPaths(databasePath: string): Promise<string[]> {
+  const database = await openTemporarySQLiteDatabase(
+    basename(databasePath),
+    { useNewConnection: true },
+    parentPath(databasePath),
+  );
+  let rows: Array<{ path: string }> | undefined;
+  let primaryError: unknown;
+  try {
+    rows = await database.getAllAsync<{ path: string }>(`
+      SELECT avatar_path AS path FROM baby WHERE avatar_path IS NOT NULL
+      UNION
+      SELECT file_path AS path FROM attachments
+      UNION
+      SELECT thumbnail_path AS path FROM attachments WHERE thumbnail_path IS NOT NULL;
+    `);
+  } catch (cause) {
+    primaryError = cause;
+  }
+  try {
+    await database.closeAsync();
+  } catch (closeError) {
+    if (primaryError !== undefined) {
+      throw new AggregateError(
+        [primaryError, closeError],
+        'Snapshot media scan failed and its SQLite connection could not close.',
+      );
+    }
+    throw closeError;
+  }
+  if (primaryError !== undefined) {
+    throw primaryError;
+  }
+  if (rows === undefined || rows.some((row) => typeof row.path !== 'string')) {
+    throw new Error('Snapshot media scan returned an invalid path.');
+  }
+  return [...new Set(rows.map((row) => row.path))].sort();
 }
 
 async function collectReferencedPaths(
@@ -742,17 +856,23 @@ function replacementPaths(
   databasePath: string,
   mediaPath: string,
   operationId: string,
+  fileSystem: BackupFileSystem,
 ): Replacement {
   return {
     databasePath,
     databaseRollbackPath: `${databasePath}.rollback-${operationId}`,
     databaseCandidatePath: `${databasePath}.restore-${operationId}`,
+    databaseRetired: false,
     mediaPath,
     mediaRollbackPath: `${mediaPath}.rollback-${operationId}`,
     mediaCandidatePath: `${mediaPath}.restore-${operationId}`,
+    mediaExisted: fileSystem.exists(mediaPath),
+    mediaRetired: false,
     databaseSidecars: databaseSidecarPaths(databasePath).map((path) => ({
       path,
       rollbackPath: `${path}.rollback-${operationId}`,
+      existed: fileSystem.exists(path),
+      retired: false,
     })),
   };
 }
@@ -767,14 +887,17 @@ async function installReplacement(
     throw new Error('Current database disappeared before replacement.');
   }
   for (const sidecar of replacement.databaseSidecars) {
-    if (fileSystem.exists(sidecar.path)) {
+    if (sidecar.existed) {
       await fileSystem.move(sidecar.path, sidecar.rollbackPath);
+      sidecar.retired = true;
     }
   }
   await fileSystem.move(replacement.databasePath, replacement.databaseRollbackPath);
+  replacement.databaseRetired = true;
   await fileSystem.move(replacement.databaseCandidatePath, replacement.databasePath);
   if (fileSystem.exists(replacement.mediaPath)) {
     await fileSystem.move(replacement.mediaPath, replacement.mediaRollbackPath);
+    replacement.mediaRetired = true;
   }
   await fileSystem.move(replacement.mediaCandidatePath, replacement.mediaPath);
 }
@@ -783,40 +906,68 @@ async function rollbackReplacement(
   replacement: Replacement,
   fileSystem: BackupFileSystem,
 ): Promise<unknown[]> {
-  const tasks: Array<() => Promise<void>> = [];
-  if (fileSystem.exists(replacement.mediaRollbackPath)) {
-    tasks.push(async () => {
+  const errors: unknown[] = [];
+  await restoreSidecarFileSet(replacement.databaseSidecars, fileSystem, errors);
+
+  await restoreRollbackFile(
+    replacement.databasePath,
+    replacement.databaseRollbackPath,
+    true,
+    replacement.databaseRetired,
+    fileSystem,
+    errors,
+  );
+
+  if (replacement.mediaRetired || fileSystem.exists(replacement.mediaRollbackPath)) {
+    await captureRollbackError(errors, async () => {
       if (fileSystem.exists(replacement.mediaPath)) {
         await fileSystem.delete(replacement.mediaPath);
       }
+      if (!fileSystem.exists(replacement.mediaRollbackPath)) {
+        throw new Error('The retired media rollback directory is missing.');
+      }
       await fileSystem.move(replacement.mediaRollbackPath, replacement.mediaPath);
     });
+  } else if (!replacement.mediaExisted && fileSystem.exists(replacement.mediaPath)) {
+    await captureRollbackError(errors, () => fileSystem.delete(replacement.mediaPath));
   }
-  if (fileSystem.exists(replacement.databaseRollbackPath)) {
-    tasks.push(async () => {
-      if (fileSystem.exists(replacement.databasePath)) {
-        await fileSystem.delete(replacement.databasePath);
-      }
-      await fileSystem.move(replacement.databaseRollbackPath, replacement.databasePath);
-    });
-  }
-  tasks.push(...replacement.databaseSidecars.flatMap((sidecar) => (
-    fileSystem.exists(sidecar.rollbackPath)
-      ? [async () => {
-        if (fileSystem.exists(sidecar.path)) {
-          await fileSystem.delete(sidecar.path);
-        }
-        await fileSystem.move(sidecar.rollbackPath, sidecar.path);
-      }]
-      : []
-  )));
+
   if (fileSystem.exists(replacement.databaseCandidatePath)) {
-    tasks.push(() => fileSystem.delete(replacement.databaseCandidatePath));
+    await captureRollbackError(
+      errors,
+      () => fileSystem.delete(replacement.databaseCandidatePath),
+    );
   }
   if (fileSystem.exists(replacement.mediaCandidatePath)) {
-    tasks.push(() => fileSystem.delete(replacement.mediaCandidatePath));
+    await captureRollbackError(
+      errors,
+      () => fileSystem.delete(replacement.mediaCandidatePath),
+    );
   }
-  return collectCleanupErrors(tasks);
+
+  verifyRollbackPath(
+    replacement.databasePath,
+    true,
+    'database',
+    fileSystem,
+    errors,
+  );
+  verifyRollbackPath(
+    replacement.mediaPath,
+    replacement.mediaExisted,
+    'media directory',
+    fileSystem,
+    errors,
+  );
+  verifySidecarFileSet(replacement.databaseSidecars, fileSystem, errors);
+  verifyAbsentRollbackArtifacts([
+    replacement.databaseRollbackPath,
+    replacement.mediaRollbackPath,
+    replacement.databaseCandidatePath,
+    replacement.mediaCandidatePath,
+    ...replacement.databaseSidecars.map((sidecar) => sidecar.rollbackPath),
+  ], fileSystem, errors);
+  return errors;
 }
 
 function replacementCleanupTasks(
@@ -836,38 +987,123 @@ function databaseSidecarPaths(databasePath: string): string[] {
   return [`${databasePath}-wal`, `${databasePath}-shm`];
 }
 
-async function restoreSidecarRollbacks(
-  sidecars: Array<{ path: string; rollbackPath: string }>,
-  fileSystem: BackupFileSystem,
-  deleteCurrent = false,
-): Promise<unknown[]> {
-  return collectCleanupErrors(sidecars.flatMap((sidecar) => {
-    if (!fileSystem.exists(sidecar.rollbackPath)) {
-      return [];
-    }
-    return [async () => {
-      if (deleteCurrent && fileSystem.exists(sidecar.path)) {
-        await fileSystem.delete(sidecar.path);
-      }
-      await fileSystem.move(sidecar.rollbackPath, sidecar.path);
-    }];
-  }));
-}
-
-async function restoreSingleRollback(
+async function rollbackDatabaseFileSet(
   databasePath: string,
   rollbackPath: string,
+  databaseRetired: boolean,
+  sidecars: RollbackFile[],
   fileSystem: BackupFileSystem,
 ): Promise<unknown[]> {
-  return collectCleanupErrors([async () => {
-    if (fileSystem.exists(databasePath)) {
-      await fileSystem.delete(databasePath);
+  const errors: unknown[] = [];
+  await restoreSidecarFileSet(sidecars, fileSystem, errors);
+  await restoreRollbackFile(
+    databasePath,
+    rollbackPath,
+    true,
+    databaseRetired,
+    fileSystem,
+    errors,
+  );
+  verifyRollbackPath(databasePath, true, 'database', fileSystem, errors);
+  verifySidecarFileSet(sidecars, fileSystem, errors);
+  verifyAbsentRollbackArtifacts(
+    [rollbackPath, ...sidecars.map((sidecar) => sidecar.rollbackPath)],
+    fileSystem,
+    errors,
+  );
+  return errors;
+}
+
+async function restoreSidecarFileSet(
+  sidecars: RollbackFile[],
+  fileSystem: BackupFileSystem,
+  errors: unknown[],
+): Promise<void> {
+  for (const sidecar of sidecars) {
+    if (sidecar.retired || fileSystem.exists(sidecar.rollbackPath)) {
+      await captureRollbackError(errors, async () => {
+        if (fileSystem.exists(sidecar.path)) {
+          await fileSystem.delete(sidecar.path);
+        }
+        if (!fileSystem.exists(sidecar.rollbackPath)) {
+          throw new Error(`The retired SQLite sidecar rollback is missing: ${sidecar.path}`);
+        }
+        await fileSystem.move(sidecar.rollbackPath, sidecar.path);
+      });
+    } else if (!sidecar.existed && fileSystem.exists(sidecar.path)) {
+      await captureRollbackError(errors, () => fileSystem.delete(sidecar.path));
     }
-    if (!fileSystem.exists(rollbackPath)) {
-      throw new Error('The rollback database is missing.');
+  }
+}
+
+async function restoreRollbackFile(
+  path: string,
+  rollbackPath: string,
+  originallyExisted: boolean,
+  retired: boolean,
+  fileSystem: BackupFileSystem,
+  errors: unknown[],
+): Promise<void> {
+  if (retired || fileSystem.exists(rollbackPath)) {
+    await captureRollbackError(errors, async () => {
+      if (fileSystem.exists(path)) {
+        await fileSystem.delete(path);
+      }
+      if (!fileSystem.exists(rollbackPath)) {
+        throw new Error(`The retired rollback file is missing: ${path}`);
+      }
+      await fileSystem.move(rollbackPath, path);
+    });
+  } else if (!originallyExisted && fileSystem.exists(path)) {
+    await captureRollbackError(errors, () => fileSystem.delete(path));
+  }
+}
+
+async function captureRollbackError(
+  errors: unknown[],
+  task: () => Promise<void>,
+): Promise<void> {
+  try {
+    await task();
+  } catch (cause) {
+    errors.push(cause);
+  }
+}
+
+function verifySidecarFileSet(
+  sidecars: RollbackFile[],
+  fileSystem: BackupFileSystem,
+  errors: unknown[],
+): void {
+  for (const sidecar of sidecars) {
+    verifyRollbackPath(sidecar.path, sidecar.existed, 'SQLite sidecar', fileSystem, errors);
+  }
+}
+
+function verifyRollbackPath(
+  path: string,
+  shouldExist: boolean,
+  label: string,
+  fileSystem: BackupFileSystem,
+  errors: unknown[],
+): void {
+  if (fileSystem.exists(path) !== shouldExist) {
+    errors.push(new Error(
+      `Rollback ${label} state is incomplete at ${path}; expected ${shouldExist ? 'present' : 'absent'}.`,
+    ));
+  }
+}
+
+function verifyAbsentRollbackArtifacts(
+  paths: string[],
+  fileSystem: BackupFileSystem,
+  errors: unknown[],
+): void {
+  for (const path of paths) {
+    if (fileSystem.exists(path)) {
+      errors.push(new Error(`Rollback artifact remains at ${path}.`));
     }
-    await fileSystem.move(rollbackPath, databasePath);
-  }]);
+  }
 }
 
 function expiredExportCleanupTasks(
@@ -968,47 +1204,66 @@ function createUuid(): string {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-function findEndOfCentralDirectory(view: DataView): number {
-  const minimumOffset = Math.max(0, view.byteLength - (22 + 0xffff));
-  for (let offset = view.byteLength - 22; offset >= minimumOffset; offset -= 1) {
-    if (readU32(view, offset) === 0x06054b50) {
+function findEndOfCentralDirectory(bytes: Uint8Array): number {
+  for (let offset = bytes.byteLength - 22; offset >= 0; offset -= 1) {
+    if (readU32(bytes, offset) === 0x06054b50) {
       return offset;
     }
   }
   throw new Error('ZIP end-of-central-directory record was not found.');
 }
 
-function readLocalHeaderPath(
-  bytes: Uint8Array,
-  view: DataView,
+async function readLocalHeader(
+  reader: BackupFileReader,
   offset: number,
-): string {
-  ensureRange(view, offset, 30, 'local header');
-  if (readU32(view, offset) !== 0x04034b50) {
+): Promise<{
+  path: string;
+  flags: number;
+  compressionMethod: number;
+  crc: number;
+  compressedSize: number;
+  uncompressedSize: number;
+  dataStart: number;
+}> {
+  const header = await readExact(reader, offset, 30, 'local header');
+  if (readU32(header, 0) !== 0x04034b50) {
     throw new Error('ZIP local header is invalid.');
   }
-  const flags = readU16(view, offset + 6);
+  const flags = readU16(header, 6);
   if ((flags & 0x0001) !== 0) {
     throw new Error('Encrypted ZIP entries are not supported.');
   }
-  const nameLength = readU16(view, offset + 26);
-  const extraLength = readU16(view, offset + 28);
-  ensureRange(view, offset + 30, nameLength + extraLength, 'local header name');
-  return decodeZipName(bytes, offset + 30, nameLength, flags);
-}
-
-function localHeaderDataStart(view: DataView, offset: number): number {
-  ensureRange(view, offset, 30, 'local header');
-  return offset + 30 + readU16(view, offset + 26) + readU16(view, offset + 28);
+  const compressionMethod = readU16(header, 8);
+  const crc = readU32(header, 14);
+  const compressedSize = readU32(header, 18);
+  const uncompressedSize = readU32(header, 22);
+  const nameLength = readU16(header, 26);
+  const extraLength = readU16(header, 28);
+  if (compressedSize === 0xffffffff || uncompressedSize === 0xffffffff) {
+    throw new Error('ZIP64 local header sizes are not supported.');
+  }
+  const variable = await readExact(
+    reader,
+    offset + 30,
+    nameLength + extraLength,
+    'local header name and extra field',
+  );
+  validateZipExtraFields(variable.subarray(nameLength), 'local');
+  return {
+    path: decodeZipName(variable.subarray(0, nameLength), flags),
+    flags,
+    compressionMethod,
+    crc,
+    compressedSize,
+    uncompressedSize,
+    dataStart: offset + 30 + nameLength + extraLength,
+  };
 }
 
 function decodeZipName(
-  bytes: Uint8Array,
-  offset: number,
-  length: number,
+  nameBytes: Uint8Array,
   flags: number,
 ): string {
-  const nameBytes = bytes.subarray(offset, offset + length);
   if ((flags & 0x0800) === 0) {
     if (nameBytes.some((value) => value > 0x7f)) {
       throw new Error('Non-UTF-8 ZIP entry names are not supported.');
@@ -1022,27 +1277,64 @@ function decodeZipName(
   }
 }
 
-function ensureRange(view: DataView, offset: number, length: number, label: string): void {
+function validateZipExtraFields(bytes: Uint8Array, location: string): void {
+  let offset = 0;
+  while (offset < bytes.length) {
+    if (bytes.length - offset < 4) {
+      throw new Error(`ZIP ${location} extra field header is truncated.`);
+    }
+    const headerId = readU16(bytes, offset);
+    const dataLength = readU16(bytes, offset + 2);
+    offset += 4;
+    if (offset + dataLength > bytes.length) {
+      throw new Error(`ZIP ${location} extra field data is truncated.`);
+    }
+    if (headerId === 0x0001) {
+      throw new Error(`ZIP64 ${location} extra fields are not supported.`);
+    }
+    offset += dataLength;
+  }
+}
+
+async function readExact(
+  reader: BackupFileReader,
+  offset: number,
+  length: number,
+  label: string,
+): Promise<Uint8Array> {
+  ensureFileRange(reader.size, offset, length, label);
+  const bytes = await reader.read(offset, length);
+  if (bytes.length !== length) {
+    throw new Error(`ZIP ${label} is truncated.`);
+  }
+  return bytes;
+}
+
+function ensureFileRange(size: number, offset: number, length: number, label: string): void {
   if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) ||
-      offset < 0 || length < 0 || offset + length > view.byteLength) {
+      offset < 0 || length < 0 || offset + length > size) {
     throw new Error(`ZIP ${label} is outside the archive.`);
   }
 }
 
-function readU16(view: DataView, offset: number): number {
-  ensureRange(view, offset, 2, 'field');
-  return view.getUint16(offset, true);
+function readU16(bytes: Uint8Array, offset: number): number {
+  ensureFileRange(bytes.byteLength, offset, 2, 'field');
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint16(offset, true);
 }
 
-function readU32(view: DataView, offset: number): number {
-  ensureRange(view, offset, 4, 'field');
-  return view.getUint32(offset, true);
+function readU32(bytes: Uint8Array, offset: number): number {
+  ensureFileRange(bytes.byteLength, offset, 4, 'field');
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(offset, true);
 }
 
 function createNativeArchive(fileSystem: BackupFileSystem): BackupArchive {
   return {
     async listEntries(sourcePath) {
-      return readZipCentralDirectory(await fileSystem.readBytes(sourcePath));
+      return withBackupFileReader(
+        fileSystem,
+        sourcePath,
+        (reader) => readZipCentralDirectory(reader),
+      );
     },
     async zip(sourceDirectory, targetPath) {
       const nativeArchive = await import('react-native-zip-archive');
@@ -1084,18 +1376,60 @@ async function pickBackupArchive(): Promise<string | null> {
   return result.canceled ? null : result.assets[0]?.uri ?? null;
 }
 
-async function sha256File(path: string, fileSystem: BackupFileSystem): Promise<string> {
-  const crypto = await import('expo-crypto');
-  const source = await fileSystem.readBytes(path);
-  const data = new ArrayBuffer(source.byteLength);
-  new Uint8Array(data).set(source);
-  const digest = await crypto.digest(
-    crypto.CryptoDigestAlgorithm.SHA256,
-    data,
-  );
-  return [...new Uint8Array(digest)]
-    .map((value) => value.toString(16).padStart(2, '0'))
-    .join('');
+export async function sha256File(path: string, fileSystem: BackupFileSystem): Promise<string> {
+  return withBackupFileReader(fileSystem, path, async (reader) => {
+    const hash = sha256.create();
+    const chunkSize = 1024 * 1024;
+    for (let offset = 0; offset < reader.size; offset += chunkSize) {
+      const length = Math.min(chunkSize, reader.size - offset);
+      const chunk = await reader.read(offset, length);
+      if (chunk.length !== length) {
+        throw new Error(`File changed or became truncated while hashing: ${path}`);
+      }
+      hash.update(chunk);
+    }
+    return [...hash.digest()]
+      .map((value) => value.toString(16).padStart(2, '0'))
+      .join('');
+  });
+}
+
+async function withBackupFileReader<T>(
+  fileSystem: BackupFileSystem,
+  path: string,
+  work: (reader: BackupFileReader) => Promise<T>,
+): Promise<T> {
+  const reader = await fileSystem.openRead(path);
+  if (!Number.isSafeInteger(reader.size) || reader.size < 0) {
+    try {
+      await reader.close();
+    } catch {
+      // The invalid reader size is the primary boundary failure.
+    }
+    throw new Error(`File reader returned an invalid size for ${path}.`);
+  }
+  let value: T | undefined;
+  let primaryError: unknown;
+  try {
+    value = await work(reader);
+  } catch (cause) {
+    primaryError = cause;
+  }
+  try {
+    await reader.close();
+  } catch (closeError) {
+    if (primaryError !== undefined) {
+      throw new AggregateError(
+        [primaryError, closeError],
+        `File read failed and its handle could not close: ${path}`,
+      );
+    }
+    throw closeError;
+  }
+  if (primaryError !== undefined) {
+    throw primaryError;
+  }
+  return value as T;
 }
 
 export async function validateSQLiteDatabaseFile(
@@ -1230,7 +1564,27 @@ const expoBackupFileSystem: BackupFileSystem = {
   availableDiskSpace: () => Paths.availableDiskSpace,
   exists: (path) => new File(path).exists || new Directory(path).exists,
   size: (path) => new File(path).size,
-  readBytes: (path) => new File(path).bytes(),
+  async openRead(path) {
+    const handle = new File(path).open(FileMode.ReadOnly);
+    const size = handle.size;
+    if (size === null) {
+      handle.close();
+      throw new Error(`Unable to determine file size: ${path}`);
+    }
+    return {
+      size,
+      async read(offset, length) {
+        if (handle.offset === null) {
+          throw new Error(`File handle is closed: ${path}`);
+        }
+        handle.offset = offset;
+        return handle.readBytes(length);
+      },
+      async close() {
+        handle.close();
+      },
+    };
+  },
   readText: (path) => new File(path).text(),
   async writeText(path, value) {
     const file = new File(path);

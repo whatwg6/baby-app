@@ -6,6 +6,26 @@ export interface DatabaseManager {
   initialize(): Promise<SQLiteDatabase>;
   withClosedDatabase<T>(work: (databasePath: string) => Promise<T>): Promise<T>;
   reopen(): Promise<SQLiteDatabase>;
+  markRecoveryRequired(cause: unknown): DatabaseRecoveryRequiredError;
+  getLifecycleSnapshot(): DatabaseLifecycleSnapshot;
+  subscribe(listener: () => void): () => void;
+}
+
+export type DatabaseLifecycleSnapshot =
+  | { status: 'closed' }
+  | { status: 'opening' }
+  | { status: 'open'; database: SQLiteDatabase }
+  | { status: 'closing'; database: SQLiteDatabase }
+  | { status: 'recovery-required'; error: DatabaseRecoveryRequiredError };
+
+export class DatabaseRecoveryRequiredError extends Error {
+  constructor(
+    message: string,
+    readonly cause: unknown,
+  ) {
+    super(message);
+    this.name = 'DatabaseRecoveryRequiredError';
+  }
 }
 
 type OpenDatabase = (databaseName: string) => Promise<SQLiteDatabase>;
@@ -14,6 +34,9 @@ class ExpoDatabaseManager implements DatabaseManager {
   private database: SQLiteDatabase | null = null;
   private opening: Promise<SQLiteDatabase> | null = null;
   private lifecycleTail: Promise<void> = Promise.resolve();
+  private lifecycleSnapshot: DatabaseLifecycleSnapshot = { status: 'closed' };
+  private readonly listeners = new Set<() => void>();
+  private recoveryRequired: DatabaseRecoveryRequiredError | null = null;
 
   constructor(
     private readonly databaseName: string,
@@ -28,6 +51,28 @@ class ExpoDatabaseManager implements DatabaseManager {
     return this.withLifecycle(() => this.initializeOpen());
   }
 
+  markRecoveryRequired(cause: unknown): DatabaseRecoveryRequiredError {
+    const error = cause instanceof DatabaseRecoveryRequiredError
+      ? cause
+      : new DatabaseRecoveryRequiredError(
+        'Local data recovery is required before the database can be reopened.',
+        cause,
+      );
+    this.recoveryRequired = error;
+    this.database = null;
+    this.publish({ status: 'recovery-required', error });
+    return error;
+  }
+
+  getLifecycleSnapshot = (): DatabaseLifecycleSnapshot => this.lifecycleSnapshot;
+
+  subscribe = (listener: () => void): (() => void) => {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  };
+
   async withClosedDatabase<T>(
     work: (databasePath: string) => Promise<T>,
   ): Promise<T> {
@@ -40,10 +85,12 @@ class ExpoDatabaseManager implements DatabaseManager {
       const cleanupErrors: unknown[] = [];
 
       try {
+        this.publish({ status: 'closing', database });
         await database.execAsync('PRAGMA wal_checkpoint(TRUNCATE);');
         await database.closeAsync();
         closeCompleted = true;
         this.invalidateDatabase(database);
+        this.publish({ status: 'closed' });
         value = await work(database.databasePath);
         workCompleted = true;
       } catch (cause) {
@@ -57,11 +104,15 @@ class ExpoDatabaseManager implements DatabaseManager {
         } catch (closeError) {
           cleanupErrors.push(closeError);
         }
+        this.publish({ status: 'closed' });
       }
-      try {
-        await this.initializeOpen();
-      } catch (reopenError) {
-        cleanupErrors.push(reopenError);
+      if (!(primaryError instanceof DatabaseRecoveryRequiredError) &&
+          this.recoveryRequired === null) {
+        try {
+          await this.initializeOpen();
+        } catch (reopenError) {
+          cleanupErrors.push(reopenError);
+        }
       }
 
       if (primaryError !== undefined) {
@@ -90,6 +141,9 @@ class ExpoDatabaseManager implements DatabaseManager {
   }
 
   private async initializeOpen(): Promise<SQLiteDatabase> {
+    if (this.recoveryRequired !== null) {
+      throw this.recoveryRequired;
+    }
     if (this.database !== null) {
       return this.database;
     }
@@ -99,10 +153,15 @@ class ExpoDatabaseManager implements DatabaseManager {
 
     const opening = this.openAndMigrate();
     this.opening = opening;
+    this.publish({ status: 'opening' });
     try {
       const database = await opening;
       this.database = database;
+      this.publish({ status: 'open', database });
       return database;
+    } catch (cause) {
+      this.publish({ status: 'closed' });
+      throw cause;
     } finally {
       if (this.opening === opening) {
         this.opening = null;
@@ -128,6 +187,13 @@ class ExpoDatabaseManager implements DatabaseManager {
   private invalidateDatabase(database: SQLiteDatabase): void {
     if (this.database === database) {
       this.database = null;
+    }
+  }
+
+  private publish(snapshot: DatabaseLifecycleSnapshot): void {
+    this.lifecycleSnapshot = snapshot;
+    for (const listener of this.listeners) {
+      listener();
     }
   }
 

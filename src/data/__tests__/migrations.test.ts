@@ -288,4 +288,64 @@ describe('DatabaseManager.withClosedDatabase', () => {
       errors: [firstCloseError, cleanupCloseError],
     });
   });
+
+  test('keeps the database closed after closed work marks recovery as required', async () => {
+    const first = new MigrationDatabase();
+    const reopened = new MigrationDatabase();
+    const openDatabase = jest
+      .fn<Promise<SQLiteDatabase>, [string]>()
+      .mockResolvedValueOnce(asSQLiteDatabase(first))
+      .mockResolvedValueOnce(asSQLiteDatabase(reopened));
+    const manager = createDatabaseManager('baby-growth.db', openDatabase);
+    const rollbackFailure = new Error('old WAL could not be restored');
+
+    await expect(manager.withClosedDatabase(async () => {
+      throw manager.markRecoveryRequired(rollbackFailure);
+    })).rejects.toMatchObject({
+      name: 'DatabaseRecoveryRequiredError',
+      cause: rollbackFailure,
+    });
+
+    expect(openDatabase).toHaveBeenCalledTimes(1);
+    expect(manager.getLifecycleSnapshot()).toMatchObject({
+      status: 'recovery-required',
+    });
+    await expect(manager.initialize()).rejects.toMatchObject({
+      name: 'DatabaseRecoveryRequiredError',
+    });
+    expect(openDatabase).toHaveBeenCalledTimes(1);
+  });
+
+  test('publishes closed lifecycle boundaries and the fresh handle before work resolves', async () => {
+    const first = new MigrationDatabase();
+    const reopened = new MigrationDatabase();
+    const openDatabase = jest
+      .fn<Promise<SQLiteDatabase>, [string]>()
+      .mockResolvedValueOnce(asSQLiteDatabase(first))
+      .mockResolvedValueOnce(asSQLiteDatabase(reopened));
+    const manager = createDatabaseManager('baby-growth.db', openDatabase);
+    const events: string[] = [];
+    manager.subscribe(() => {
+      const snapshot = manager.getLifecycleSnapshot();
+      events.push(snapshot.status === 'open'
+        ? `open:${snapshot.database === asSQLiteDatabase(reopened) ? 'fresh' : 'initial'}`
+        : snapshot.status);
+    });
+
+    await manager.initialize();
+    events.length = 0;
+    await manager.withClosedDatabase(async () => {
+      events.push('closed-work');
+    });
+    events.push('service-continued');
+
+    expect(events).toEqual([
+      'closing',
+      'closed',
+      'closed-work',
+      'opening',
+      'open:fresh',
+      'service-continued',
+    ]);
+  });
 });
