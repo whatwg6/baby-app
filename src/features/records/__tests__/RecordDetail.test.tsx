@@ -1,0 +1,167 @@
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import { Alert } from 'react-native';
+
+import type { RecordRepository } from '../../../data/repositories';
+import type { MediaService } from '../../media/mediaService';
+import RecordDetail from '../RecordDetail';
+import { MemoryRecordRepository } from '../../../test/memoryRepositories';
+
+jest.mock('expo-video', () => {
+  const { View } = require('react-native') as typeof import('react-native');
+  return {
+    useVideoPlayer: () => ({ play: jest.fn() }),
+    VideoView: (props: Record<string, unknown>) => <View {...props} />,
+  };
+});
+
+test('shows growth measurements in cm and kg and a missing-media placeholder', async () => {
+  const repository = new MemoryRecordRepository();
+  const record = await repository.create({
+    type: 'growth',
+    occurredAt: '2026-08-02T09:30:00.000Z',
+    note: '本月体检',
+    details: { heightCm: 66.2, weightKg: 7.4, headCm: 42.1 },
+    attachments: [
+      {
+        id: 'missing-photo',
+        mediaType: 'image',
+        filePath: '',
+        thumbnailPath: null,
+      },
+    ],
+  });
+
+  const onEdit = jest.fn();
+
+  await render(<RecordDetail repository={repository} recordId={record.id} onEdit={onEdit} />);
+
+  await waitFor(() => expect(screen.getByText('身高 66.2 cm')).toBeTruthy());
+  expect(screen.getByText('体重 7.4 kg')).toBeTruthy();
+  expect(screen.getByText('头围 42.1 cm')).toBeTruthy();
+  expect(screen.getByText('媒体文件不可用')).toBeTruthy();
+  fireEvent.press(screen.getByRole('button', { name: '编辑' }));
+
+  expect(onEdit).toHaveBeenCalledWith(`/record/edit/${record.id}`);
+  expect(screen.getByRole('button', { name: '删除' }).props.accessibilityState.disabled).toBe(true);
+});
+
+test('shows a not-found state when the requested record does not exist', async () => {
+  await render(<RecordDetail repository={new MemoryRecordRepository()} recordId="missing-record" />);
+
+  await waitFor(() => expect(screen.getByText('记录不存在')).toBeTruthy());
+});
+
+test('uses the original private video path for playable detail media', async () => {
+  const repository = new MemoryRecordRepository();
+  const record = await repository.create({
+    type: 'moment',
+    occurredAt: '2026-08-02T09:30:00.000Z',
+    note: null,
+    details: null,
+    attachments: [{
+      id: 'video-detail',
+      mediaType: 'video',
+      filePath: 'file:///documents/media/detail.mp4',
+      thumbnailPath: 'file:///documents/media/detail-thumb.jpg',
+    }],
+  });
+
+  await render(<RecordDetail repository={repository} recordId={record.id} />);
+
+  const playback = await screen.findByRole('button', { name: '播放视频' });
+  expect(playback).toBeTruthy();
+  expect(screen.queryByText('媒体文件不可用')).toBeNull();
+});
+
+test('retries a failed record lookup', async () => {
+  const storedRepository = new MemoryRecordRepository();
+  const record = await storedRepository.create({
+    type: 'milestone',
+    occurredAt: '2026-08-02T09:30:00.000Z',
+    note: null,
+    details: { title: '会翻身', presetKey: 'roll-over' },
+    attachments: [],
+  });
+  let shouldFail = true;
+  const retryingRepository: RecordRepository = {
+    create: (input) => storedRepository.create(input),
+    update: (id, input) => storedRepository.update(id, input),
+    delete: (id) => storedRepository.delete(id),
+    list: (filter) => storedRepository.list(filter),
+    listPage: (options) => storedRepository.listPage(options),
+    withTransaction: (work) => storedRepository.withTransaction(work),
+    get: (id) => (shouldFail ? Promise.reject(new Error('database is unavailable')) : storedRepository.get(id)),
+  };
+
+  await render(<RecordDetail repository={retryingRepository} recordId={record.id} />);
+
+  await waitFor(() => expect(screen.getByText('无法读取记录，请重试')).toBeTruthy());
+  shouldFail = false;
+  await act(async () => {
+    fireEvent.press(screen.getByRole('button', { name: '重试' }));
+    await Promise.resolve();
+  });
+
+  await waitFor(() => expect(screen.getByText('会翻身')).toBeTruthy());
+});
+
+test('routes the detail delete action through irreversible confirmation', async () => {
+  const repository = new MemoryRecordRepository();
+  const record = await repository.create({
+    type: 'moment',
+    occurredAt: '2026-08-02T09:30:00.000Z',
+    note: '第一次散步',
+    details: null,
+    attachments: [],
+  });
+  const onDelete = jest.fn();
+  const alert = jest.spyOn(Alert, 'alert');
+  const media: jest.Mocked<MediaService> = {
+    stage: jest.fn(),
+    commit: jest.fn(),
+    rollback: jest.fn(),
+    remove: jest.fn(async (_paths) => undefined),
+    removeOrphans: jest.fn(),
+  };
+
+  const view = await render(
+    <RecordDetail
+      media={media}
+      onDelete={onDelete}
+      recordId={record.id}
+      repository={repository}
+    />,
+  );
+  const deleteButton = await view.findByRole('button', { name: '删除' });
+  await fireEvent.press(deleteButton);
+
+  expect(alert).toHaveBeenCalledWith(
+    '删除这条记录？此操作无法撤销。',
+    undefined,
+    expect.any(Array),
+  );
+  expect(onDelete).not.toHaveBeenCalled();
+});
+
+test('keeps attachment-heavy detail actions reachable in a keyboard-aware scroll container', async () => {
+  const repository = new MemoryRecordRepository();
+  const record = await repository.create({
+    type: 'moment',
+    occurredAt: '2026-08-02T09:30:00.000Z',
+    note: '很多照片的一天',
+    details: null,
+    attachments: Array.from({ length: 12 }, (_, index) => ({
+      id: `detail-photo-${index}`,
+      mediaType: 'image' as const,
+      filePath: `file:///documents/media/detail-${index}.jpg`,
+      thumbnailPath: null,
+    })),
+  });
+
+  const view = await render(<RecordDetail repository={repository} recordId={record.id} />);
+  await view.findByRole('button', { name: '编辑' });
+
+  expect(view.queryByTestId('record-detail-keyboard-avoiding')).toBeTruthy();
+  expect(view.getByTestId('record-detail-scroll').props.keyboardShouldPersistTaps).toBe('handled');
+  expect(view.getByRole('button', { name: '删除' })).toBeTruthy();
+});

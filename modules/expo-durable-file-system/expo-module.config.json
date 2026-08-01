@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["ExpoDurableFileSystemModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.durablefilesystem.ExpoDurableFileSystemModule"]
+  }
+}
