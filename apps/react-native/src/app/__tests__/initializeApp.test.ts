@@ -60,6 +60,9 @@ test('initializes storage, database, cleanup, and stable services in dependency 
   } as unknown as MediaService;
   const backup = {} as BackupService;
   const maintenance = createMaintenanceCoordinator();
+  const repairMediaPaths = jest.fn(async () => {
+    events.push('repair-media-paths');
+  });
 
   const services = await initializeApp({
     database,
@@ -75,6 +78,7 @@ test('initializes storage, database, cleanup, and stable services in dependency 
     repositoryFactory: () => repositories,
     backupFactory: () => backup,
     maintenance,
+    repairMediaPaths,
   });
   events.push('return-services');
 
@@ -82,6 +86,7 @@ test('initializes storage, database, cleanup, and stable services in dependency 
     'ensure-directories',
     'open-database',
     'migrate',
+    'repair-media-paths',
     'clear-staging',
     'read-media-references',
     'remove-orphans',

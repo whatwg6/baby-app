@@ -2,6 +2,7 @@ import { Directory, Paths } from 'expo-file-system';
 import type { SQLiteDatabase } from 'expo-sqlite';
 
 import { createDatabaseManager, type DatabaseManager } from '../data/database';
+import { repairMediaPaths as repairPrivateMediaPaths } from '../data/mediaPathMigration';
 import {
   createSQLiteRepositories,
   type BabyRepository,
@@ -45,6 +46,7 @@ export type InitializeAppDependencies = {
   backupFactory?: BackupFactory;
   cleanupMedia?: typeof removeUnreferencedMedia;
   maintenance?: MaintenanceCoordinator;
+  repairMediaPaths?: typeof repairPrivateMediaPaths;
 };
 
 export async function initializeApp(
@@ -56,9 +58,11 @@ export async function initializeApp(
   const repositoryFactory = dependencies.repositoryFactory ?? createSQLiteRepositories;
   const cleanupMedia = dependencies.cleanupMedia ?? removeUnreferencedMedia;
   const maintenance = dependencies.maintenance ?? createMaintenanceCoordinator();
+  const repairMediaPaths = dependencies.repairMediaPaths ?? repairPrivateMediaPaths;
 
   await mediaStorage.ensureDirectories();
   const databaseHandle = await database.initialize();
+  await repairMediaPaths(databaseHandle, appendPath(Paths.document.uri, 'media'));
   const repositories = repositoryFactory(databaseHandle);
   await mediaStorage.clearStaging();
   await cleanupMedia({

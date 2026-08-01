@@ -41,6 +41,16 @@ class LayoutDatabase {
     return { user_version: 1 } as T;
   }
 
+  async getAllAsync<T>(): Promise<T[]> {
+    return [];
+  }
+
+  async withExclusiveTransactionAsync(
+    work: (transaction: SQLiteDatabase) => Promise<void>,
+  ): Promise<void> {
+    await work(asSQLiteDatabase(this));
+  }
+
   async closeAsync(): Promise<void> {
     this.closed = true;
   }

@@ -39,6 +39,40 @@ export function normalizePrivateRoot(root: string): string {
   }
 }
 
+export function rebaseLegacyPrivateMediaPath(path: string, root: string): string {
+  try {
+    return normalizePrivateFilePath(path, root);
+  } catch (cause) {
+    if (!(cause instanceof UnsafeMediaPathError)) {
+      throw cause;
+    }
+
+    try {
+      const candidate = parseFileUri(path);
+      const privateRoot = parseFileUri(root);
+      if (candidate.protocol !== privateRoot.protocol ||
+          candidate.host !== privateRoot.host ||
+          candidate.username !== privateRoot.username ||
+          candidate.password !== privateRoot.password ||
+          candidate.port !== privateRoot.port) {
+        throw new Error('scheme or authority mismatch');
+      }
+
+      const segments = candidate.pathname.split('/');
+      const filename = segments.at(-1);
+      if (filename === undefined || filename.length === 0 ||
+          segments.at(-2) !== 'media' || segments.at(-3) !== 'Documents') {
+        throw new Error('path is not legacy iOS private media');
+      }
+
+      const normalizedRoot = normalizePrivateRoot(root);
+      return normalizePrivateFilePath(`${normalizedRoot}/${filename}`, normalizedRoot);
+    } catch {
+      throw cause;
+    }
+  }
+}
+
 function parseFileUri(value: string): URL {
   if (value.length === 0 || value.includes('\0') || value.includes('\\') ||
       value.includes('?') || value.includes('#')) {
