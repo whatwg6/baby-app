@@ -47,8 +47,28 @@ type BabyRow = {
   updated_at: string;
 };
 
+type RecordPageCursor = {
+  occurredAt: string;
+  createdAt: string;
+  id: string;
+};
+
+type RecordPage = {
+  records: Awaited<ReturnType<RecordRepository['list']>>;
+  nextCursor: RecordPageCursor | null;
+};
+
+type PagedRecordRepository = RecordRepository & {
+  listPage(options?: {
+    types?: RecordType[];
+    cursor?: RecordPageCursor | null;
+    limit?: number;
+  }): Promise<RecordPage>;
+};
+
 class SQLiteRepositoryDouble {
   readonly databasePath = ':memory:';
+  readonly readQueries: Array<{ kind: 'all' | 'first'; sql: string }> = [];
   private records = new Map<string, RecordRow>();
   private growthDetails = new Map<string, GrowthDetails>();
   private activityDetails = new Map<string, ActivityDetails>();
@@ -64,6 +84,10 @@ class SQLiteRepositoryDouble {
 
   failNextBabyRead(): void {
     this.babyReadFailures += 1;
+  }
+
+  clearReadQueries(): void {
+    this.readQueries.length = 0;
   }
 
   async withExclusiveTransactionAsync(
@@ -289,6 +313,7 @@ class SQLiteRepositoryDouble {
   }
 
   async getFirstAsync<T>(sql: string, ...rawParams: unknown[]): Promise<T | null> {
+    this.readQueries.push({ kind: 'first', sql });
     const params = bindParams(rawParams);
     const recordId = params[0] as string;
 
@@ -316,18 +341,74 @@ class SQLiteRepositoryDouble {
   }
 
   async getAllAsync<T>(sql: string, ...rawParams: unknown[]): Promise<T[]> {
+    this.readQueries.push({ kind: 'all', sql });
     const params = bindParams(rawParams);
+    if (sql.includes('SELECT avatar_path AS path FROM baby')) {
+      return [
+        ...this.babies.flatMap((baby) => baby.avatar_path === null ? [] : [{ path: baby.avatar_path }]),
+        ...[...this.attachments.values()].flatMap((attachment) => [
+          { path: attachment.file_path },
+          ...(attachment.thumbnail_path === null ? [] : [{ path: attachment.thumbnail_path }]),
+        ]),
+      ] as T[];
+    }
     if (sql.includes('FROM records')) {
-      const requestedTypes = params as RecordType[];
-      return [...this.records.values()]
+      const typePlaceholderCount = sql.match(/type IN \(([^)]+)\)/)?.[1]
+        ?.split(',').length ?? 0;
+      const requestedTypes = params.slice(0, typePlaceholderCount) as RecordType[];
+      const cursorOffset = typePlaceholderCount;
+      const hasCursor = sql.includes('occurred_at < ?');
+      const cursor = hasCursor
+        ? {
+          occurredAt: params[cursorOffset] as string,
+          createdAt: params[cursorOffset + 2] as string,
+          id: params[cursorOffset + 5] as string,
+        }
+        : null;
+      const limit = sql.includes('LIMIT ?') ? params.at(-1) as number : null;
+      const rows = [...this.records.values()]
         .filter((record) => requestedTypes.length === 0 || requestedTypes.includes(record.type))
-        .sort((left, right) => right.occurred_at.localeCompare(left.occurred_at)) as T[];
+        .filter((record) => cursor === null
+          || record.occurred_at < cursor.occurredAt
+          || (
+            record.occurred_at === cursor.occurredAt
+            && record.created_at < cursor.createdAt
+          )
+          || (
+            record.occurred_at === cursor.occurredAt
+            && record.created_at === cursor.createdAt
+            && record.id < cursor.id
+          ))
+        .sort((left, right) => right.occurred_at.localeCompare(left.occurred_at)
+          || right.created_at.localeCompare(left.created_at)
+          || right.id.localeCompare(left.id));
+      return (limit === null ? rows : rows.slice(0, limit)) as T[];
+    }
+    if (sql.includes('FROM growth_details')) {
+      return params.flatMap((recordId) => {
+        const details = this.growthDetails.get(recordId as string);
+        return details === undefined ? [] : [{ recordId, ...details }];
+      }) as T[];
+    }
+    if (sql.includes('FROM activity_details')) {
+      return params.flatMap((recordId) => {
+        const details = this.activityDetails.get(recordId as string);
+        return details === undefined ? [] : [{ recordId, ...details }];
+      }) as T[];
+    }
+    if (sql.includes('FROM milestone_details')) {
+      return params.flatMap((recordId) => {
+        const details = this.milestoneDetails.get(recordId as string);
+        return details === undefined ? [] : [{ recordId, ...details }];
+      }) as T[];
     }
     if (sql.includes('FROM attachments')) {
-      const recordId = params[0] as string;
+      const recordIds = new Set(params as string[]);
       return [...this.attachments.values()]
-        .filter((attachment) => attachment.record_id === recordId)
-        .sort((left, right) => left.created_at.localeCompare(right.created_at)) as T[];
+        .filter((attachment) => recordIds.has(attachment.record_id))
+        .sort((left, right) => left.record_id.localeCompare(right.record_id)
+          || left.created_at.localeCompare(right.created_at)
+          || left.id.localeCompare(right.id)) as T[];
     }
 
     throw new Error(`Unhandled SQL: ${sql}`);
@@ -423,6 +504,81 @@ export function recordRepositoryContract(
     ]);
   });
 
+  test('pages a filtered timeline without gaps or duplicates', async () => {
+    const repository = await createRepository() as PagedRecordRepository;
+    const oldestMoment = await repository.create(momentInputFixture({
+      occurredAt: '2026-08-01T09:00:00.000Z',
+      note: '最早瞬间',
+    }));
+    const growth = await repository.create({
+      type: 'growth',
+      occurredAt: '2026-08-01T10:00:00.000Z',
+      note: null,
+      details: { heightCm: 66.2, weightKg: 7.4, headCm: null },
+      attachments: [],
+    });
+    const middleMoment = await repository.create(momentInputFixture({
+      occurredAt: '2026-08-01T11:00:00.000Z',
+      note: '中间瞬间',
+    }));
+    const activity = await repository.create({
+      type: 'activity',
+      occurredAt: '2026-08-01T12:00:00.000Z',
+      note: null,
+      details: { activityType: 'sleep', amount: null, durationMinutes: 45 },
+      attachments: [],
+    });
+    const latestMoment = await repository.create(momentInputFixture({
+      occurredAt: '2026-08-01T13:00:00.000Z',
+      note: '最新瞬间',
+    }));
+
+    const firstPage = await repository.listPage({ limit: 2 });
+    expect(firstPage.records.map((record) => record.id)).toEqual([
+      latestMoment.id,
+      activity.id,
+    ]);
+    expect(firstPage.nextCursor).toEqual({
+      occurredAt: activity.occurredAt,
+      createdAt: activity.createdAt,
+      id: activity.id,
+    });
+
+    const secondPage = await repository.listPage({
+      cursor: firstPage.nextCursor,
+      limit: 2,
+    });
+    expect(secondPage.records.map((record) => record.id)).toEqual([
+      middleMoment.id,
+      growth.id,
+    ]);
+    expect(secondPage.nextCursor).toEqual({
+      occurredAt: growth.occurredAt,
+      createdAt: growth.createdAt,
+      id: growth.id,
+    });
+
+    const finalPage = await repository.listPage({
+      cursor: secondPage.nextCursor,
+      limit: 2,
+    });
+    expect(finalPage.records.map((record) => record.id)).toEqual([oldestMoment.id]);
+    expect(finalPage.nextCursor).toBeNull();
+
+    const firstMomentPage = await repository.listPage({ types: ['moment'], limit: 2 });
+    expect(firstMomentPage.records.map((record) => record.id)).toEqual([
+      latestMoment.id,
+      middleMoment.id,
+    ]);
+    const secondMomentPage = await repository.listPage({
+      types: ['moment'],
+      cursor: firstMomentPage.nextCursor,
+      limit: 2,
+    });
+    expect(secondMomentPage.records.map((record) => record.id)).toEqual([oldestMoment.id]);
+    expect(secondMomentPage.nextCursor).toBeNull();
+  });
+
   test('keeps an existing attachment index timestamp when updating its record', async () => {
     jest.useFakeTimers();
     try {
@@ -465,6 +621,35 @@ describe('SQLite RecordRepository mapping', () => {
     const database = new SQLiteRepositoryDouble();
     return createSQLiteRepositories(database as unknown as SQLiteDatabase).records;
   });
+
+  test('hydrates a complete page with a bounded set of batch reads', async () => {
+    const database = new SQLiteRepositoryDouble();
+    const records = createSQLiteRepositories(database as unknown as SQLiteDatabase).records;
+    for (const input of recordVariantFixtures()) {
+      await records.create(input);
+    }
+    database.clearReadQueries();
+
+    const page = await records.listPage({ limit: 4 });
+
+    expect(page.records).toHaveLength(4);
+    expect(page.records.find((record) => record.type === 'growth')?.details).toEqual({
+      heightCm: 66.2,
+      weightKg: 7.4,
+      headCm: null,
+    });
+    expect(page.records.find((record) => record.type === 'activity')?.details).toEqual({
+      activityType: 'sleep',
+      amount: null,
+      durationMinutes: 45,
+    });
+    expect(page.records.find((record) => record.type === 'moment')?.attachments).toHaveLength(1);
+    expect(database.readQueries.filter((query) => query.kind === 'first')).toHaveLength(0);
+    expect(database.readQueries).toHaveLength(5);
+    expect(database.readQueries[0]?.sql.replace(/\s+/g, ' ')).toContain(
+      'ORDER BY occurred_at DESC, created_at DESC, id DESC',
+    );
+  });
 });
 
 describe('SQLite BabyRepository mapping', () => {
@@ -496,5 +681,38 @@ describe('SQLite BabyRepository mapping', () => {
     })).rejects.toThrow('baby read failed after write');
 
     await expect(babies.get()).resolves.toEqual(original);
+  });
+});
+
+describe('SQLite media-reference mapping', () => {
+  test('reads avatar and attachment paths directly without hydrating domain records', async () => {
+    const database = new SQLiteRepositoryDouble();
+    const repositories = createSQLiteRepositories(database as unknown as SQLiteDatabase) as ReturnType<
+      typeof createSQLiteRepositories
+    > & {
+      mediaReferences: { listReferencedMediaPaths(): Promise<string[]> };
+    };
+    await repositories.babies.save({
+      ...babyInputFixture(),
+      avatarPath: 'file:///documents/media/avatar.jpg',
+    });
+    await repositories.records.create(momentInputFixture());
+    database.clearReadQueries();
+
+    const paths = await repositories.mediaReferences.listReferencedMediaPaths();
+
+    expect(new Set(paths)).toEqual(new Set([
+      'file:///documents/media/avatar.jpg',
+      'file:///media/first-look.jpg',
+      'file:///media/first-look-thumb.jpg',
+    ]));
+    expect(database.readQueries).toHaveLength(1);
+    expect(database.readQueries[0]?.kind).toBe('all');
+    expect(database.readQueries[0]?.sql.replace(/\s+/g, ' ')).toContain(
+      'SELECT avatar_path AS path FROM baby',
+    );
+    expect(database.readQueries[0]?.sql.replace(/\s+/g, ' ')).toContain(
+      'SELECT file_path AS path FROM attachments',
+    );
   });
 });

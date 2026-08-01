@@ -56,8 +56,8 @@ export function DeleteRecordButton({
       let attachments: Awaited<ReturnType<RecordRepository['delete']>>;
       try {
         attachments = await repository.delete(recordId);
-      } catch {
-        setMessage('删除失败（数据库阶段），请重试');
+      } catch (cause) {
+        setMessage(`删除失败（数据库阶段）：${errorMessage(cause)}，请重试`);
         return;
       }
       const paths = [...new Set(attachments.flatMap((attachment) => [

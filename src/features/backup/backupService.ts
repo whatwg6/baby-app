@@ -3,10 +3,19 @@ import { Directory, File, FileMode, Paths } from 'expo-file-system';
 import type { SQLiteDatabase } from 'expo-sqlite';
 
 import type { DatabaseManager } from '../../data/database';
+import type { MaintenanceCoordinator } from '../../app/maintenance';
 import type { BabyRepository, RecordRepository } from '../../data/repositories';
 import { migrateDatabase } from '../../data/migrations';
 import type { MediaService } from '../media/mediaService';
+import {
+  normalizePrivateFilePath,
+  normalizePrivateRoot,
+} from '../media/mediaPaths';
 import { parseBackupManifest, type BackupManifestV1 } from './backupManifest';
+import {
+  syncDirectoryToStableStorage,
+  syncFileToStableStorage,
+} from './durableFileSystem';
 
 export interface BackupArchiveEntry {
   path: string;
@@ -32,6 +41,8 @@ export interface BackupFileSystem {
   readText(path: string): Promise<string>;
   writeText(path: string, value: string): Promise<void>;
   ensureDirectory(path: string): Promise<void>;
+  syncFile(path: string): Promise<void>;
+  syncDirectory(path: string): Promise<void>;
   copyFile(source: string, target: string): Promise<void>;
   move(source: string, target: string): Promise<void>;
   delete(path: string): Promise<void>;
@@ -97,6 +108,7 @@ type BackupServiceDependencies = {
   babies: BabyRepository;
   records: RecordRepository;
   media: MediaService;
+  maintenance?: MaintenanceCoordinator;
   fileSystem?: BackupFileSystem;
   archive?: BackupArchive;
   sharing?: BackupSharing;
@@ -370,113 +382,177 @@ export function createBackupService(dependencies: BackupServiceDependencies): Ba
         return { status: 'cancelled' };
       }
 
-      const operationId = safeOperationId(createId());
-      const operationDirectory = joinPath(workRoot, operationId);
-      let inspection: InspectedBackup | undefined;
-      let replacement: Replacement | undefined;
-      let mediaCandidatePath: string | undefined;
-      let primaryError: unknown;
-      let cleanupWarning: string | undefined;
-      let replacementCompleted = false;
+      const maintenanceLease = dependencies.maintenance?.begin('restore');
+      let durableWarning: string | undefined;
       try {
-        inspection = await inspectIntoWorkDirectory(archivePath, operationId);
-        mediaCandidatePath = `${mediaDirectory}.restore-${operationId}`;
-        if (fileSystem.exists(mediaCandidatePath)) {
-          await fileSystem.delete(mediaCandidatePath);
-        }
-        await fileSystem.ensureDirectory(mediaCandidatePath);
-        for (const mediaEntry of inspection.manifest.media) {
-          await fileSystem.copyFile(
-            archiveFilePath(inspection.extractionDirectory, mediaEntry.path),
-            joinPath(mediaCandidatePath, basename(mediaEntry.path)),
-          );
-        }
+        const operationId = safeOperationId(createId());
+        const operationDirectory = joinPath(workRoot, operationId);
+        let inspection: InspectedBackup | undefined;
+        let mediaCandidatePath: string | undefined;
+        let primaryError: unknown;
+        let cleanupWarning: string | undefined;
+        try {
+          inspection = await inspectIntoWorkDirectory(archivePath, operationId);
+          mediaCandidatePath = `${mediaDirectory}.restore-${operationId}`;
+          if (fileSystem.exists(mediaCandidatePath)) {
+            await fileSystem.delete(mediaCandidatePath);
+          }
+          await fileSystem.ensureDirectory(mediaCandidatePath);
+          for (const mediaEntry of inspection.manifest.media) {
+            const candidatePath = joinPath(mediaCandidatePath, basename(mediaEntry.path));
+            await fileSystem.copyFile(
+              archiveFilePath(inspection.extractionDirectory, mediaEntry.path),
+              candidatePath,
+            );
+            await fileSystem.syncFile(candidatePath);
+          }
+          await fileSystem.syncDirectory(mediaCandidatePath);
 
-        await dependencies.database.withClosedDatabase(async (databasePath) => {
-          replacement = replacementPaths(databasePath, mediaDirectory, operationId, fileSystem);
-          try {
-            await installReplacement(
-              replacement,
-              archiveFilePath(inspection!.extractionDirectory, DATABASE_ARCHIVE_PATH),
+          await dependencies.database.withRecoveryJournal({
+            operation: 'restore',
+            operationId,
+          }, async ({ closeReopened, databasePath, reopen }) => {
+            const replacement = replacementPaths(
+              databasePath,
+              mediaDirectory,
+              operationId,
               fileSystem,
             );
-            replacementCompleted = true;
-          } catch (cause) {
-            const rollbackErrors = await rollbackReplacement(replacement, fileSystem);
-            if (rollbackErrors.length > 0) {
-              throw dependencies.database.markRecoveryRequired(new AggregateError(
-                [cause, ...rollbackErrors],
-                '恢复失败且旧数据回滚不完整；数据库已保持关闭',
-              ));
-            }
-            throw asBackupError('replace', '替换本地数据失败，旧数据已恢复', cause);
-          }
-        });
-      } catch (cause) {
-        primaryError = cause;
-        if (replacementCompleted && replacement !== undefined) {
-          const rollbackErrors = await rollbackReplacement(replacement, fileSystem);
-          if (rollbackErrors.length > 0) {
-            primaryError = dependencies.database.markRecoveryRequired(new AggregateError(
-              [cause, ...rollbackErrors],
-              '数据库重开失败且旧数据回滚不完整；数据库已保持关闭',
-            ));
-          } else {
             try {
-              await dependencies.database.reopen();
-            } catch (reopenError) {
-              primaryError = new AggregateError(
-                [cause, reopenError],
-                '恢复数据无法打开；旧数据已完整回滚，但数据库重开失败',
+              await installReplacement(
+                replacement,
+                archiveFilePath(inspection!.extractionDirectory, DATABASE_ARCHIVE_PATH),
+                fileSystem,
               );
+            } catch (cause) {
+              const rollbackErrors = await rollbackReplacement(replacement, fileSystem);
+              if (rollbackErrors.length > 0) {
+                throw dependencies.database.markRecoveryRequired(new AggregateError(
+                  [cause, ...rollbackErrors],
+                  '恢复失败且旧数据回滚不完整；数据库已保持关闭',
+                ));
+              }
+              try {
+                await reopen();
+              } catch (reopenError) {
+                throw dependencies.database.markRecoveryRequired(new AggregateError(
+                  [cause, reopenError],
+                  '恢复替换失败；旧数据已回滚但无法安全重开',
+                ));
+              }
+              throw asBackupError('replace', '替换本地数据失败，旧数据已恢复', cause);
             }
-          }
-        }
-      }
 
-      const cleanupTasks: Array<() => Promise<void>> = [];
-      if (primaryError === undefined && replacement !== undefined) {
-        cleanupTasks.push(...replacementCleanupTasks(replacement, fileSystem));
-      }
-      if (mediaCandidatePath !== undefined && fileSystem.exists(mediaCandidatePath)) {
-        cleanupTasks.push(() => fileSystem.delete(mediaCandidatePath!));
-      }
-      if (fileSystem.exists(operationDirectory)) {
-        cleanupTasks.push(() => fileSystem.delete(operationDirectory));
-      }
-      const cleanupErrors = await collectCleanupErrors(cleanupTasks);
-      if (primaryError !== undefined) {
-        if (cleanupErrors.length > 0) {
-          throw new AggregateError([primaryError, ...cleanupErrors], '恢复失败且临时文件清理失败');
+            try {
+              await reopen();
+            } catch (cause) {
+              const rollbackErrors = await rollbackReplacement(replacement, fileSystem);
+              if (rollbackErrors.length > 0) {
+                throw dependencies.database.markRecoveryRequired(new AggregateError(
+                  [cause, ...rollbackErrors],
+                  '数据库重开失败且旧数据回滚不完整；数据库已保持关闭',
+                ));
+              }
+              try {
+                await reopen();
+              } catch (reopenError) {
+                throw dependencies.database.markRecoveryRequired(new AggregateError(
+                  [cause, reopenError],
+                  '恢复数据无法打开；旧数据已完整回滚，但数据库重开失败',
+                ));
+              }
+              throw cause;
+            }
+
+            const retirementErrors = await retireRollbackArtifacts(
+              replacementArtifactPaths(replacement),
+              fileSystem,
+            );
+            if (retirementErrors.length > 0) {
+              let recoveryCause: unknown = new AggregateError(
+                retirementErrors,
+                '恢复后的旧数据库或媒体文件无法安全退役；数据库已保持关闭',
+              );
+              try {
+                await closeReopened();
+              } catch (closeError) {
+                recoveryCause = new AggregateError(
+                  [...retirementErrors, closeError],
+                  '恢复回滚文件退役失败，且新数据库句柄无法确认关闭',
+                );
+              }
+              throw dependencies.database.markRecoveryRequired(recoveryCause);
+            }
+          });
+        } catch (cause) {
+          primaryError = cause;
         }
-        throw primaryError;
+
+        const cleanupTasks: Array<() => Promise<void>> = [];
+        if (mediaCandidatePath !== undefined && fileSystem.exists(mediaCandidatePath)) {
+          cleanupTasks.push(() => fileSystem.delete(mediaCandidatePath!));
+        }
+        if (fileSystem.exists(operationDirectory)) {
+          cleanupTasks.push(() => fileSystem.delete(operationDirectory));
+        }
+        const cleanupErrors = await collectCleanupErrors(cleanupTasks);
+        if (primaryError !== undefined) {
+          if (cleanupErrors.length > 0) {
+            durableWarning = cleanupMessage(cleanupErrors);
+            throw new AggregateError([primaryError, ...cleanupErrors], '恢复失败且临时文件清理失败');
+          }
+          throw primaryError;
+        }
+        if (cleanupErrors.length > 0) {
+          cleanupWarning = cleanupMessage(cleanupErrors);
+        }
+        durableWarning = cleanupWarning;
+        return { status: 'restored', ...(cleanupWarning === undefined ? {} : { cleanupWarning }) };
+      } finally {
+        maintenanceLease?.finish(
+          durableWarning === undefined ? undefined : { warning: durableWarning },
+        );
       }
-      if (cleanupErrors.length > 0) {
-        cleanupWarning = cleanupMessage(cleanupErrors);
-      }
-      return { status: 'restored', ...(cleanupWarning === undefined ? {} : { cleanupWarning }) };
     },
 
     async clear() {
-      const operationId = safeOperationId(createId());
-      const referencedPaths = await collectReferencedPaths(
-        dependencies.babies,
-        dependencies.records,
-      );
-      let databasePath: string | undefined;
-      let rollbackPath: string | undefined;
-      let sidecarRollbacks: RollbackFile[] = [];
-      let databaseCleared = false;
+      const maintenanceLease = dependencies.maintenance?.begin('clear');
+      let durableWarning: string | undefined;
       try {
-        await dependencies.database.withClosedDatabase(async (currentDatabasePath) => {
-          databasePath = currentDatabasePath;
-          rollbackPath = `${currentDatabasePath}.rollback-clear-${operationId}`;
-          sidecarRollbacks = databaseSidecarPaths(currentDatabasePath).map((path) => ({
+        const operationId = safeOperationId(createId());
+        await dependencies.database.withRecoveryJournal({
+          operation: 'clear',
+          operationId,
+        }, async ({ closeReopened, databasePath: currentDatabasePath, reopen }) => {
+          const rollbackPath = `${currentDatabasePath}.rollback-clear-${operationId}`;
+          const mediaRollbackPath = `${mediaDirectory}.rollback-clear-${operationId}`;
+          const mediaExisted = fileSystem.exists(mediaDirectory);
+          const sidecarRollbacks = databaseSidecarPaths(currentDatabasePath).map((path) => ({
             path,
             rollbackPath: `${path}.rollback-clear-${operationId}`,
             existed: fileSystem.exists(path),
             retired: false,
           }));
+          let databaseCleared = false;
+          let mediaRetired = false;
+          const rollbackClear = async (): Promise<unknown[]> => {
+            const errors = await rollbackDatabaseFileSet(
+              currentDatabasePath,
+              rollbackPath,
+              databaseCleared,
+              sidecarRollbacks,
+              fileSystem,
+            );
+            await rollbackMediaDirectory(
+              mediaDirectory,
+              mediaRollbackPath,
+              mediaExisted,
+              mediaRetired,
+              fileSystem,
+              errors,
+            );
+            return errors;
+          };
           try {
             for (const sidecar of sidecarRollbacks) {
               if (sidecar.existed) {
@@ -486,81 +562,82 @@ export function createBackupService(dependencies: BackupServiceDependencies): Ba
             }
             await fileSystem.move(currentDatabasePath, rollbackPath);
             databaseCleared = true;
+            if (mediaExisted) {
+              await fileSystem.move(mediaDirectory, mediaRollbackPath);
+              mediaRetired = true;
+            }
+            await fileSystem.ensureDirectory(mediaDirectory);
           } catch (cause) {
-            const rollbackErrors = await rollbackDatabaseFileSet(
-              currentDatabasePath,
-              rollbackPath,
-              databaseCleared,
-              sidecarRollbacks,
-              fileSystem,
-            );
+            const rollbackErrors = await rollbackClear();
             if (rollbackErrors.length > 0) {
               throw dependencies.database.markRecoveryRequired(new AggregateError(
                 [cause, ...rollbackErrors],
-                '清空数据库失败且 SQLite 文件集回滚不完整；数据库已保持关闭',
+                '清空数据库或媒体目录失败且旧数据回滚不完整；数据库已保持关闭',
+              ));
+            }
+            try {
+              await reopen();
+            } catch (reopenError) {
+              throw dependencies.database.markRecoveryRequired(new AggregateError(
+                [cause, reopenError],
+                '清空替换失败；旧数据库已回滚但无法安全重开',
               ));
             }
             throw asBackupError('replace', '清空数据库失败，媒体尚未删除', cause);
           }
-        });
-      } catch (cause) {
-        if (databaseCleared && databasePath !== undefined && rollbackPath !== undefined) {
-          const rollbackErrors = await rollbackDatabaseFileSet(
-            databasePath,
-            rollbackPath,
-            databaseCleared,
-            sidecarRollbacks,
+
+          try {
+            await reopen();
+          } catch (cause) {
+            const rollbackErrors = await rollbackClear();
+            if (rollbackErrors.length > 0) {
+              throw dependencies.database.markRecoveryRequired(new AggregateError(
+                [cause, ...rollbackErrors],
+                '清空失败且旧数据库回滚不完整；数据库已保持关闭',
+              ));
+            }
+            try {
+              await reopen();
+            } catch (reopenError) {
+              throw dependencies.database.markRecoveryRequired(new AggregateError(
+                [cause, reopenError],
+                '清空失败；旧数据库已完整回滚，但数据库重开失败',
+              ));
+            }
+            throw cause;
+          }
+
+          const retirementErrors = await retireRollbackArtifacts(
+            [
+              rollbackPath,
+              mediaRollbackPath,
+              ...sidecarRollbacks.map((sidecar) => sidecar.rollbackPath),
+            ],
             fileSystem,
           );
-          if (rollbackErrors.length > 0) {
-            throw dependencies.database.markRecoveryRequired(new AggregateError(
-              [cause, ...rollbackErrors],
-              '清空失败且旧数据库回滚不完整；数据库已保持关闭',
-            ));
-          }
-          try {
-            await dependencies.database.reopen();
-          } catch (reopenError) {
-            throw new AggregateError(
-              [cause, reopenError],
-              '清空失败；旧数据库已完整回滚，但数据库重开失败',
+          if (retirementErrors.length > 0) {
+            let recoveryCause: unknown = new AggregateError(
+              retirementErrors,
+              '清空后的旧数据库文件无法安全退役；数据库已保持关闭',
             );
+            try {
+              await closeReopened();
+            } catch (closeError) {
+              recoveryCause = new AggregateError(
+                [...retirementErrors, closeError],
+                '旧数据库文件退役失败，且新数据库句柄无法确认关闭',
+              );
+            }
+            throw dependencies.database.markRecoveryRequired(recoveryCause);
           }
-        }
-        throw cause;
-      }
+        });
 
-      const cleanupErrors: unknown[] = [];
-      if (rollbackPath !== undefined && fileSystem.exists(rollbackPath)) {
-        try {
-          await fileSystem.delete(rollbackPath);
-        } catch (cause) {
-          cleanupErrors.push(cause);
-        }
+        return { cleanupPending: false };
+      } finally {
+        maintenanceLease?.finish(
+          durableWarning === undefined ? undefined : { warning: durableWarning },
+        );
       }
-      cleanupErrors.push(...await collectCleanupErrors(
-        sidecarRollbacks.flatMap((sidecar) => fileSystem.exists(sidecar.rollbackPath)
-          ? [() => fileSystem.delete(sidecar.rollbackPath)]
-          : []),
-      ));
-
-      if (referencedPaths.length > 0) {
-        try {
-          await dependencies.media.remove(referencedPaths);
-        } catch (cause) {
-          cleanupErrors.push(cause);
-        }
-      }
-      try {
-        await dependencies.media.removeOrphans([]);
-      } catch (cause) {
-        cleanupErrors.push(cause);
-      }
-
-      return {
-        cleanupPending: cleanupErrors.length > 0,
-        ...(cleanupErrors.length === 0 ? {} : { warning: cleanupMessage(cleanupErrors) }),
-      };
     },
   };
 }
@@ -605,20 +682,16 @@ export async function readZipCentralDirectory(
     const flags = readU16(header, 8);
     const compressionMethod = readU16(header, 10);
     const crc = readU32(header, 16);
-    const compressedSize = readU32(header, 20);
-    const uncompressedSize = readU32(header, 24);
+    const compressedSize32 = readU32(header, 20);
+    const uncompressedSize32 = readU32(header, 24);
     const nameLength = readU16(header, 28);
     const extraLength = readU16(header, 30);
     const entryCommentLength = readU16(header, 32);
-    const startDisk = readU16(header, 34);
+    const startDisk16 = readU16(header, 34);
     const externalAttributes = readU32(header, 38);
-    const localHeaderOffset = readU32(header, 42);
+    const localHeaderOffset32 = readU32(header, 42);
     if ((flags & 0x0001) !== 0) {
       throw new Error('Encrypted ZIP entries are not supported.');
-    }
-    if (compressedSize === 0xffffffff || uncompressedSize === 0xffffffff ||
-        localHeaderOffset === 0xffffffff || startDisk !== 0) {
-      throw new Error('ZIP64 entries are not supported.');
     }
     ensureFileRange(
       reader.size,
@@ -634,7 +707,21 @@ export async function readZipCentralDirectory(
     );
     const nameBytes = variable.subarray(0, nameLength);
     const extraBytes = variable.subarray(nameLength);
-    validateZipExtraFields(extraBytes, 'central');
+    const zip64Extra = parseZipExtraFields(extraBytes, 'central');
+    const {
+      compressedSize,
+      uncompressedSize,
+      localHeaderOffset,
+      startDisk,
+    } = resolveCentralZip64Fields({
+      compressedSize32,
+      localHeaderOffset32,
+      startDisk16,
+      uncompressedSize32,
+    }, zip64Extra);
+    if (startDisk !== 0) {
+      throw new Error('Multi-disk ZIP entries are not supported.');
+    }
     const path = decodeZipName(nameBytes, flags);
     const local = await readLocalHeader(reader, localHeaderOffset);
     if (local.path !== path) {
@@ -655,9 +742,7 @@ export async function readZipCentralDirectory(
     if (local.uncompressedSize !== uncompressedSize) {
       throw new Error('ZIP local header uncompressed size does not match its central directory entry.');
     }
-    if (local.dataStart + compressedSize > centralOffset) {
-      throw new Error('ZIP entry data escapes its local file area.');
-    }
+    ensureFileRange(centralOffset, local.dataStart, compressedSize, 'entry data');
     const platform = versionMadeBy >>> 8;
     const unixMode = externalAttributes >>> 16;
     entries.push({
@@ -724,7 +809,7 @@ function validateManifestPaths(manifest: BackupManifestV1): void {
 }
 
 function validateArchivePath(path: string, isDirectory: boolean): void {
-  if (path.length === 0 || path.includes('\0') || path.includes('\\') ||
+  if (path.length === 0 || path.includes('\0') || path.includes('%') || path.includes('\\') ||
       path.startsWith('/') || /^[a-zA-Z]:/.test(path) || /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(path)) {
     throw new Error(`Archive entry path is unsafe: ${path}`);
   }
@@ -784,17 +869,22 @@ function mapReferencedMedia(
   mediaDirectory: string,
 ): Array<{ sourcePath: string; archivePath: string }> {
   return uniquePaths.map((sourcePath) => {
-    const prefix = `${stripTrailingSlash(mediaDirectory)}/`;
-    if (!sourcePath.startsWith(prefix)) {
+    let normalizedSource: string;
+    let normalizedRoot: string;
+    try {
+      normalizedRoot = normalizePrivateRoot(mediaDirectory);
+      normalizedSource = normalizePrivateFilePath(sourcePath, normalizedRoot);
+    } catch (cause) {
       throw new BackupServiceError('files', `媒体路径不在 App 私有目录中：${sourcePath}`);
     }
-    const relativePath = sourcePath.slice(prefix.length);
+    const prefix = `${stripTrailingSlash(normalizedRoot)}/`;
+    const relativePath = normalizedSource.slice(prefix.length);
     const archivePath = `media/${relativePath}`;
     validateArchivePath(archivePath, false);
     if (!isFlatMediaArchivePath(archivePath)) {
       throw new BackupServiceError('files', `媒体路径不符合备份格式：${sourcePath}`);
     }
-    return { sourcePath, archivePath };
+    return { sourcePath: normalizedSource, archivePath };
   });
 }
 
@@ -837,21 +927,6 @@ async function readSQLiteMediaPaths(databasePath: string): Promise<string[]> {
   return [...new Set(rows.map((row) => row.path))].sort();
 }
 
-async function collectReferencedPaths(
-  babies: BabyRepository,
-  records: RecordRepository,
-): Promise<string[]> {
-  const [baby, timeline] = await Promise.all([babies.get(), records.list()]);
-  const paths = [
-    ...(baby?.avatarPath === null || baby?.avatarPath === undefined ? [] : [baby.avatarPath]),
-    ...timeline.flatMap((record) => record.attachments.flatMap((attachment) => [
-      attachment.filePath,
-      ...(attachment.thumbnailPath === null ? [] : [attachment.thumbnailPath]),
-    ])),
-  ];
-  return [...new Set(paths)].sort();
-}
-
 function replacementPaths(
   databasePath: string,
   mediaPath: string,
@@ -883,6 +958,7 @@ async function installReplacement(
   fileSystem: BackupFileSystem,
 ): Promise<void> {
   await fileSystem.copyFile(restoredDatabasePath, replacement.databaseCandidatePath);
+  await fileSystem.syncFile(replacement.databaseCandidatePath);
   if (!fileSystem.exists(replacement.databasePath)) {
     throw new Error('Current database disappeared before replacement.');
   }
@@ -918,19 +994,14 @@ async function rollbackReplacement(
     errors,
   );
 
-  if (replacement.mediaRetired || fileSystem.exists(replacement.mediaRollbackPath)) {
-    await captureRollbackError(errors, async () => {
-      if (fileSystem.exists(replacement.mediaPath)) {
-        await fileSystem.delete(replacement.mediaPath);
-      }
-      if (!fileSystem.exists(replacement.mediaRollbackPath)) {
-        throw new Error('The retired media rollback directory is missing.');
-      }
-      await fileSystem.move(replacement.mediaRollbackPath, replacement.mediaPath);
-    });
-  } else if (!replacement.mediaExisted && fileSystem.exists(replacement.mediaPath)) {
-    await captureRollbackError(errors, () => fileSystem.delete(replacement.mediaPath));
-  }
+  await rollbackMediaDirectory(
+    replacement.mediaPath,
+    replacement.mediaRollbackPath,
+    replacement.mediaExisted,
+    replacement.mediaRetired,
+    fileSystem,
+    errors,
+  );
 
   if (fileSystem.exists(replacement.databaseCandidatePath)) {
     await captureRollbackError(
@@ -970,17 +1041,82 @@ async function rollbackReplacement(
   return errors;
 }
 
-function replacementCleanupTasks(
-  replacement: Replacement,
+async function rollbackMediaDirectory(
+  mediaPath: string,
+  rollbackPath: string,
+  mediaExisted: boolean,
+  mediaRetired: boolean,
   fileSystem: BackupFileSystem,
-): Array<() => Promise<void>> {
+  errors: unknown[],
+): Promise<void> {
+  let rollbackVisible = mediaRetired;
+  if (!rollbackVisible) {
+    try {
+      rollbackVisible = fileSystem.exists(rollbackPath);
+    } catch (cause) {
+      errors.push(cause);
+    }
+  }
+
+  if (rollbackVisible) {
+    await captureRollbackError(errors, async () => {
+      if (fileSystem.exists(mediaPath)) {
+        await fileSystem.delete(mediaPath);
+      }
+      if (!fileSystem.exists(rollbackPath)) {
+        throw new Error('The retired media rollback directory is missing.');
+      }
+      await fileSystem.move(rollbackPath, mediaPath);
+    });
+  } else if (!mediaExisted) {
+    await captureRollbackError(errors, async () => {
+      if (fileSystem.exists(mediaPath)) {
+        await fileSystem.delete(mediaPath);
+      }
+    });
+  }
+
+  verifyRollbackPath(mediaPath, mediaExisted, 'media directory', fileSystem, errors);
+  verifyAbsentRollbackArtifacts([rollbackPath], fileSystem, errors);
+}
+
+function replacementArtifactPaths(replacement: Replacement): string[] {
   return [
     replacement.databaseRollbackPath,
     replacement.mediaRollbackPath,
     replacement.databaseCandidatePath,
     replacement.mediaCandidatePath,
     ...replacement.databaseSidecars.map((sidecar) => sidecar.rollbackPath),
-  ].flatMap((path) => fileSystem.exists(path) ? [() => fileSystem.delete(path)] : []);
+  ];
+}
+
+async function retireRollbackArtifacts(
+  paths: string[],
+  fileSystem: BackupFileSystem,
+): Promise<unknown[]> {
+  const errors: unknown[] = [];
+  for (const path of paths) {
+    let exists: boolean;
+    try {
+      exists = fileSystem.exists(path);
+    } catch (cause) {
+      errors.push(cause);
+      continue;
+    }
+    if (exists) {
+      await captureRollbackError(errors, () => fileSystem.delete(path));
+    }
+  }
+  for (const path of paths) {
+    try {
+      if (fileSystem.exists(path)) {
+        errors.push(new Error(`Rollback artifact remains at ${path}.`));
+      }
+    } catch (cause) {
+      errors.push(cause);
+    }
+  }
+  return errors;
 }
 
 function databaseSidecarPaths(databasePath: string): string[] {
@@ -1235,20 +1371,22 @@ async function readLocalHeader(
   }
   const compressionMethod = readU16(header, 8);
   const crc = readU32(header, 14);
-  const compressedSize = readU32(header, 18);
-  const uncompressedSize = readU32(header, 22);
+  const compressedSize32 = readU32(header, 18);
+  const uncompressedSize32 = readU32(header, 22);
   const nameLength = readU16(header, 26);
   const extraLength = readU16(header, 28);
-  if (compressedSize === 0xffffffff || uncompressedSize === 0xffffffff) {
-    throw new Error('ZIP64 local header sizes are not supported.');
-  }
   const variable = await readExact(
     reader,
     offset + 30,
     nameLength + extraLength,
     'local header name and extra field',
   );
-  validateZipExtraFields(variable.subarray(nameLength), 'local');
+  const zip64Extra = parseZipExtraFields(variable.subarray(nameLength), 'local');
+  const { compressedSize, uncompressedSize } = resolveLocalZip64Fields(
+    compressedSize32,
+    uncompressedSize32,
+    zip64Extra,
+  );
   return {
     path: decodeZipName(variable.subarray(0, nameLength), flags),
     flags,
@@ -1277,8 +1415,12 @@ function decodeZipName(
   }
 }
 
-function validateZipExtraFields(bytes: Uint8Array, location: string): void {
+function parseZipExtraFields(
+  bytes: Uint8Array,
+  location: 'central' | 'local',
+): Uint8Array | null {
   let offset = 0;
+  let zip64: Uint8Array | null = null;
   while (offset < bytes.length) {
     if (bytes.length - offset < 4) {
       throw new Error(`ZIP ${location} extra field header is truncated.`);
@@ -1290,10 +1432,123 @@ function validateZipExtraFields(bytes: Uint8Array, location: string): void {
       throw new Error(`ZIP ${location} extra field data is truncated.`);
     }
     if (headerId === 0x0001) {
-      throw new Error(`ZIP64 ${location} extra fields are not supported.`);
+      if (zip64 !== null) {
+        throw new Error(`ZIP64 ${location} extra field is duplicated.`);
+      }
+      zip64 = bytes.subarray(offset, offset + dataLength);
     }
     offset += dataLength;
   }
+  return zip64;
+}
+
+function resolveCentralZip64Fields(
+  fields: {
+    compressedSize32: number;
+    uncompressedSize32: number;
+    localHeaderOffset32: number;
+    startDisk16: number;
+  },
+  extra: Uint8Array | null,
+): {
+  compressedSize: number;
+  uncompressedSize: number;
+  localHeaderOffset: number;
+  startDisk: number;
+} {
+  const needsExtra = fields.uncompressedSize32 === 0xffffffff ||
+    fields.compressedSize32 === 0xffffffff ||
+    fields.localHeaderOffset32 === 0xffffffff ||
+    fields.startDisk16 === 0xffff;
+  if (!needsExtra) {
+    if (extra !== null) {
+      throw new Error('ZIP64 central extra field is unexpected.');
+    }
+    return {
+      compressedSize: fields.compressedSize32,
+      uncompressedSize: fields.uncompressedSize32,
+      localHeaderOffset: fields.localHeaderOffset32,
+      startDisk: fields.startDisk16,
+    };
+  }
+  if (extra === null) {
+    throw new Error('ZIP64 central extra field is missing.');
+  }
+
+  let offset = 0;
+  const takeU64 = (label: string): number => {
+    const value = readZip64U64(extra, offset, `central ${label}`);
+    offset += 8;
+    return value;
+  };
+  const uncompressedSize = fields.uncompressedSize32 === 0xffffffff
+    ? takeU64('uncompressed size')
+    : fields.uncompressedSize32;
+  const compressedSize = fields.compressedSize32 === 0xffffffff
+    ? takeU64('compressed size')
+    : fields.compressedSize32;
+  const localHeaderOffset = fields.localHeaderOffset32 === 0xffffffff
+    ? takeU64('local header offset')
+    : fields.localHeaderOffset32;
+  let startDisk = fields.startDisk16;
+  if (fields.startDisk16 === 0xffff) {
+    if (offset + 4 > extra.length) {
+      throw new Error('ZIP64 central start disk is truncated.');
+    }
+    startDisk = readU32(extra, offset);
+    offset += 4;
+  }
+  if (offset !== extra.length) {
+    throw new Error('ZIP64 central extra field has unexpected trailing data.');
+  }
+  return { compressedSize, localHeaderOffset, startDisk, uncompressedSize };
+}
+
+function resolveLocalZip64Fields(
+  compressedSize32: number,
+  uncompressedSize32: number,
+  extra: Uint8Array | null,
+): { compressedSize: number; uncompressedSize: number } {
+  const needsExtra = compressedSize32 === 0xffffffff || uncompressedSize32 === 0xffffffff;
+  if (!needsExtra) {
+    if (extra !== null) {
+      throw new Error('ZIP64 local extra field is unexpected.');
+    }
+    return { compressedSize: compressedSize32, uncompressedSize: uncompressedSize32 };
+  }
+  if (extra === null) {
+    throw new Error('ZIP64 local extra field is missing.');
+  }
+
+  let offset = 0;
+  const takeU64 = (label: string): number => {
+    const value = readZip64U64(extra, offset, `local ${label}`);
+    offset += 8;
+    return value;
+  };
+  const uncompressedSize = uncompressedSize32 === 0xffffffff
+    ? takeU64('uncompressed size')
+    : uncompressedSize32;
+  const compressedSize = compressedSize32 === 0xffffffff
+    ? takeU64('compressed size')
+    : compressedSize32;
+  if (offset !== extra.length) {
+    throw new Error('ZIP64 local extra field has unexpected trailing data.');
+  }
+  return { compressedSize, uncompressedSize };
+}
+
+function readZip64U64(bytes: Uint8Array, offset: number, label: string): number {
+  if (offset + 8 > bytes.length) {
+    throw new Error(`ZIP64 ${label} is truncated.`);
+  }
+  const low = readU32(bytes, offset);
+  const high = readU32(bytes, offset + 4);
+  const value = high * 0x1_0000_0000 + low;
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`ZIP64 ${label} exceeds the safe integer range.`);
+  }
+  return value;
 }
 
 async function readExact(
@@ -1312,6 +1567,7 @@ async function readExact(
 
 function ensureFileRange(size: number, offset: number, length: number, label: string): void {
   if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) ||
+      !Number.isSafeInteger(offset + length) ||
       offset < 0 || length < 0 || offset + length > size) {
     throw new Error(`ZIP ${label} is outside the archive.`);
   }
@@ -1593,6 +1849,12 @@ const expoBackupFileSystem: BackupFileSystem = {
   },
   async ensureDirectory(path) {
     new Directory(path).create({ idempotent: true, intermediates: true });
+  },
+  async syncFile(path) {
+    await syncFileToStableStorage(path);
+  },
+  async syncDirectory(path) {
+    await syncDirectoryToStableStorage(path);
   },
   async copyFile(source, target) {
     await new File(source).copy(new File(target), { overwrite: true });

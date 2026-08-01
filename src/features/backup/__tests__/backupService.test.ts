@@ -4,6 +4,7 @@ import {
   type DatabaseManager,
 } from '../../../data/database';
 import type { MediaService } from '../../media/mediaService';
+import { createMaintenanceCoordinator } from '../../../app/maintenance';
 import { openDatabaseAsync, type SQLiteDatabase } from 'expo-sqlite';
 import {
   createBackupService,
@@ -73,6 +74,20 @@ describe('BackupService export', () => {
 
     expect(fixture.archive.zip).not.toHaveBeenCalled();
     expect(fixture.sharing.share).not.toHaveBeenCalled();
+  });
+
+  test('rejects encoded traversal in a stored private-media reference before export', async () => {
+    const fixture = createFixture();
+    const unsafePath = 'file:///documents/media/%252e%252e%252foutside.jpg';
+    fixture.fileSystem.seedFile(unsafePath, bytes('outside'));
+    fixture.readSnapshotMediaPaths.mockResolvedValue([unsafePath]);
+
+    await expect(fixture.service.export()).rejects.toMatchObject({
+      name: 'BackupServiceError',
+      stage: 'files',
+    });
+
+    expect(fixture.archive.zip).not.toHaveBeenCalled();
   });
 
   test('keeps the archive and returns its path when system sharing is unavailable', async () => {
@@ -150,6 +165,11 @@ describe('BackupService inspection', () => {
     'C:\\outside.txt',
     'media\\..\\outside.txt',
     'media/bad\0name.jpg',
+    'media/%2e%2e%2foutside.jpg',
+    'media/%252e%252e%252foutside.jpg',
+    'media/folder%2Fphoto.jpg',
+    'media/folder%255Cphoto.jpg',
+    'media/%70hoto.jpg',
   ])('rejects unsafe central-directory path %p before native extraction', async (unsafePath) => {
     const fixture = createFixture();
     fixture.archive.listEntries.mockResolvedValue([
@@ -186,6 +206,30 @@ describe('BackupService inspection', () => {
     }]);
 
     await expect(readZipCentralDirectory(memoryReader(archive))).rejects.toThrow(reason);
+  });
+
+  test('accepts the forced ZIP64 size fields emitted by the iOS exporter', async () => {
+    const payload = [0x61, 0x62, 0x63];
+    const sizes = zip64Extra([payload.length, payload.length]);
+    const archive = zipFixture([{
+      centralPath: 'manifest.json',
+      localPath: 'manifest.json',
+      centralCompressedSize: 0xffffffff,
+      centralUncompressedSize: 0xffffffff,
+      localCompressedSize: 0xffffffff,
+      localUncompressedSize: 0xffffffff,
+      centralExtra: sizes,
+      localExtra: sizes,
+      data: payload,
+    }]);
+
+    await expect(readZipCentralDirectory(memoryReader(archive))).resolves.toEqual([
+      expect.objectContaining({
+        path: 'manifest.json',
+        compressedSize: 3,
+        uncompressedSize: 3,
+      }),
+    ]);
   });
 
   test.each([
@@ -307,6 +351,122 @@ describe('BackupService inspection', () => {
 });
 
 describe('BackupService restore', () => {
+  test('pre-arms a recovery journal before the first restore rename', async () => {
+    const fixture = createFixture();
+
+    await fixture.service.restore('file:///picker/valid.zip');
+
+    expect(fixture.database.withRecoveryJournal).toHaveBeenCalledWith(
+      { operation: 'restore', operationId: 'restore-id' },
+      expect.any(Function),
+    );
+    expect(jest.mocked(fixture.database.withRecoveryJournal).mock.invocationCallOrder[0])
+      .toBeLessThan(fixture.fileSystem.move.mock.invocationCallOrder[0] ?? Number.MAX_SAFE_INTEGER);
+  });
+
+  test('syncs every restore payload and the candidate media directory before replacement', async () => {
+    const fixture = createFixture();
+
+    await fixture.service.restore('file:///picker/valid.zip');
+
+    const mediaCandidate = 'file:///documents/media.restore-restore-id';
+    const databaseCandidate = '/sqlite/app.db.restore-restore-id';
+    expect(fixture.fileSystem.syncFile).toHaveBeenCalledWith(`${mediaCandidate}/photo.jpg`);
+    expect(fixture.fileSystem.syncDirectory).toHaveBeenCalledWith(mediaCandidate);
+    expect(fixture.fileSystem.syncFile).toHaveBeenCalledWith(databaseCandidate);
+
+    const firstMove = fixture.fileSystem.move.mock.invocationCallOrder[0];
+    const databaseSyncIndex = fixture.fileSystem.syncFile.mock.calls
+      .findIndex(([path]) => path === databaseCandidate);
+    const mediaSyncIndex = fixture.fileSystem.syncFile.mock.calls
+      .findIndex(([path]) => path === `${mediaCandidate}/photo.jpg`);
+    expect(fixture.fileSystem.syncFile.mock.invocationCallOrder[databaseSyncIndex])
+      .toBeLessThan(firstMove);
+    expect(fixture.fileSystem.syncFile.mock.invocationCallOrder[mediaSyncIndex])
+      .toBeLessThan(fixture.fileSystem.syncDirectory.mock.invocationCallOrder[0]);
+    expect(fixture.fileSystem.syncDirectory.mock.invocationCallOrder[0]).toBeLessThan(firstMove);
+  });
+
+  test('aborts before arming recovery if a copied media payload cannot be synced', async () => {
+    const fixture = createFixture();
+    const syncError = new Error('media fsync failed');
+    fixture.fileSystem.failSync(
+      'file:///documents/media.restore-restore-id/photo.jpg',
+      syncError,
+    );
+
+    await expect(fixture.service.restore('file:///picker/valid.zip')).rejects.toThrow(syncError);
+
+    expect(fixture.database.withRecoveryJournal).not.toHaveBeenCalled();
+    await expect(fixture.fileSystem.readBytes('/sqlite/app.db')).resolves.toEqual(OLD_DATABASE);
+    await expect(fixture.fileSystem.readBytes('file:///documents/media/old.jpg'))
+      .resolves.toEqual(bytes('old photo'));
+  });
+
+  test('holds root maintenance through cleanup and durably publishes its warning', async () => {
+    const fixture = createFixture();
+    const operationDirectory = 'file:///cache/backup-work/restore-id';
+    let activeDuringCleanup = false;
+    fixture.fileSystem.observeDelete(operationDirectory, () => {
+      activeDuringCleanup = fixture.maintenance.getSnapshot().active;
+    });
+    fixture.fileSystem.failDelete(operationDirectory, new Error('restore temp is locked'));
+
+    const result = await fixture.service.restore('file:///picker/valid.zip');
+
+    expect(activeDuringCleanup).toBe(true);
+    expect(result).toMatchObject({
+      status: 'restored',
+      cleanupWarning: expect.stringContaining('restore temp is locked'),
+    });
+    expect(fixture.maintenance.getSnapshot()).toMatchObject({
+      active: false,
+      operation: null,
+      warning: expect.stringContaining('restore temp is locked'),
+    });
+  });
+
+  test('retires successful restore rollback artifacts before the recovery journal can clear', async () => {
+    const fixture = createFixture();
+    fixture.fileSystem.seedFile('/sqlite/app.db-wal', bytes('old wal'));
+    fixture.fileSystem.seedFile('/sqlite/app.db-shm', bytes('old shm'));
+
+    await fixture.service.restore('file:///picker/valid.zip');
+
+    const journalCleared = fixture.events.indexOf('journal-cleared');
+    expect(journalCleared).toBeGreaterThan(-1);
+    for (const rollbackPath of [
+      '/sqlite/app.db.rollback-restore-id',
+      '/sqlite/app.db-wal.rollback-restore-id',
+      '/sqlite/app.db-shm.rollback-restore-id',
+      'file:///documents/media.rollback-restore-id',
+    ]) {
+      expect(fixture.fileSystem.exists(rollbackPath)).toBe(false);
+      expect(fixture.events.indexOf(`delete:${rollbackPath}`)).toBeGreaterThan(-1);
+      expect(fixture.events.indexOf(`delete:${rollbackPath}`)).toBeLessThan(journalCleared);
+    }
+  });
+
+  test('keeps recovery armed and closes the restored handle when rollback retirement fails', async () => {
+    const fixture = createFixture();
+    const retirementError = new Error('restored rollback database is locked');
+    fixture.fileSystem.failDelete('/sqlite/app.db.rollback-restore-id', retirementError);
+
+    await expect(fixture.service.restore('file:///picker/valid.zip')).rejects.toMatchObject({
+      name: 'DatabaseRecoveryRequiredError',
+    });
+
+    expect(fixture.database.markRecoveryRequired).toHaveBeenCalledWith(expect.objectContaining({
+      errors: expect.arrayContaining([retirementError]),
+    }));
+    expect(fixture.events).not.toContain('journal-cleared');
+    expect(fixture.events.indexOf('database-close-reopened')).toBeGreaterThan(-1);
+    expect(fixture.events.indexOf('database-close-reopened')).toBeLessThan(
+      fixture.events.indexOf('recovery-required'),
+    );
+    expect(fixture.fileSystem.exists('/sqlite/app.db.rollback-restore-id')).toBe(true);
+  });
+
   test('removes a registered media candidate when copying its first payload fails', async () => {
     const fixture = createFixture();
     fixture.fileSystem.failCopyTo(
@@ -408,7 +568,7 @@ describe('BackupService restore', () => {
     await expect(fixture.fileSystem.readBytes('/sqlite/app.db')).resolves.toEqual(OLD_DATABASE);
     await expect(fixture.fileSystem.readBytes('/sqlite/app.db-wal')).resolves.toEqual(bytes('old wal'));
     await expect(fixture.fileSystem.readBytes('/sqlite/app.db-shm')).resolves.toEqual(bytes('old shm'));
-    expect(fixture.database.reopen).toHaveBeenCalledTimes(1);
+    expect(fixture.events).toContain('journal-cleared');
   });
 
   test('removes candidate sidecars when the old database had no sidecars before reopening', async () => {
@@ -424,7 +584,7 @@ describe('BackupService restore', () => {
     await expect(fixture.fileSystem.readBytes('/sqlite/app.db')).resolves.toEqual(OLD_DATABASE);
     expect(fixture.fileSystem.exists('/sqlite/app.db-wal')).toBe(false);
     expect(fixture.fileSystem.exists('/sqlite/app.db-shm')).toBe(false);
-    expect(fixture.database.reopen).toHaveBeenCalledTimes(1);
+    expect(fixture.events).toContain('journal-cleared');
   });
 
   test('keeps the database closed when a retired old sidecar rollback copy is missing', async () => {
@@ -447,18 +607,133 @@ describe('BackupService restore', () => {
 });
 
 describe('BackupService clear', () => {
-  test('commits an empty database first and reports cleanup pending if post-delete media cleanup fails', async () => {
+  test('owns the global maintenance lease through whole-media retirement', async () => {
     const fixture = createFixture();
-    fixture.media.remove.mockRejectedValue(new Error('media is locked'));
+    let activeDuringRetirement = false;
+    fixture.fileSystem.observeDelete(
+      'file:///documents/media.rollback-clear-restore-id',
+      () => {
+        activeDuringRetirement = fixture.maintenance.getSnapshot().active;
+      },
+    );
 
     const result = await fixture.service.clear();
 
-    expect(result.cleanupPending).toBe(true);
-    expect(fixture.media.removeOrphans).toHaveBeenCalledWith([]);
-    expect(fixture.fileSystem.exists('/sqlite/app.db')).toBe(false);
+    expect(activeDuringRetirement).toBe(true);
+    expect(result).toEqual({ cleanupPending: false });
+    expect(fixture.maintenance.getSnapshot()).toMatchObject({
+      active: false,
+      operation: null,
+      warning: null,
+    });
   });
 
-  test('can clear a database containing a stale external media reference', async () => {
+  test('pre-arms recovery and atomically swaps the whole media directory before publishing', async () => {
+    const fixture = createFixture();
+
+    await fixture.service.clear();
+
+    expect(fixture.database.withRecoveryJournal).toHaveBeenCalledWith(
+      { operation: 'clear', operationId: 'restore-id' },
+      expect.any(Function),
+    );
+    expect(jest.mocked(fixture.database.withRecoveryJournal).mock.invocationCallOrder[0])
+      .toBeLessThan(fixture.fileSystem.move.mock.invocationCallOrder[0] ?? Number.MAX_SAFE_INTEGER);
+    expect(fixture.fileSystem.move).toHaveBeenCalledWith(
+      'file:///documents/media',
+      'file:///documents/media.rollback-clear-restore-id',
+    );
+    expect(fixture.fileSystem.ensureDirectory).toHaveBeenCalledWith('file:///documents/media');
+    expect(fixture.media.remove).not.toHaveBeenCalled();
+    expect(fixture.media.removeOrphans).not.toHaveBeenCalled();
+    expect(fixture.events.indexOf('delete:file:///documents/media.rollback-clear-restore-id'))
+      .toBeLessThan(fixture.events.indexOf('journal-cleared'));
+    expect(fixture.fileSystem.list('file:///documents/media')).toEqual([]);
+  });
+
+  test('retires the old database file set before the recovery journal can clear', async () => {
+    const fixture = createFixture();
+    fixture.fileSystem.seedFile('/sqlite/app.db-wal', bytes('old wal'));
+    fixture.fileSystem.seedFile('/sqlite/app.db-shm', bytes('old shm'));
+
+    await fixture.service.clear();
+
+    const journalCleared = fixture.events.indexOf('journal-cleared');
+    expect(journalCleared).toBeGreaterThan(-1);
+    for (const rollbackPath of [
+      '/sqlite/app.db.rollback-clear-restore-id',
+      '/sqlite/app.db-wal.rollback-clear-restore-id',
+      '/sqlite/app.db-shm.rollback-clear-restore-id',
+    ]) {
+      expect(fixture.fileSystem.exists(rollbackPath)).toBe(false);
+      expect(fixture.events.indexOf(`delete:${rollbackPath}`)).toBeGreaterThan(-1);
+      expect(fixture.events.indexOf(`delete:${rollbackPath}`)).toBeLessThan(journalCleared);
+    }
+  });
+
+  test('keeps recovery armed and closes the empty handle when old-database retirement fails', async () => {
+    const fixture = createFixture();
+    const retirementError = new Error('old database rollback is locked');
+    fixture.fileSystem.failDelete(
+      '/sqlite/app.db.rollback-clear-restore-id',
+      retirementError,
+    );
+
+    await expect(fixture.service.clear()).rejects.toMatchObject({
+      name: 'DatabaseRecoveryRequiredError',
+    });
+
+    expect(fixture.database.markRecoveryRequired).toHaveBeenCalledWith(expect.objectContaining({
+      errors: expect.arrayContaining([retirementError]),
+    }));
+    expect(fixture.events).not.toContain('journal-cleared');
+    expect(fixture.events.indexOf('database-close-reopened')).toBeGreaterThan(-1);
+    expect(fixture.events.indexOf('database-close-reopened')).toBeLessThan(
+      fixture.events.indexOf('recovery-required'),
+    );
+    expect(fixture.fileSystem.exists('/sqlite/app.db.rollback-clear-restore-id')).toBe(true);
+  });
+
+  test('fails closed when old-database retirement cannot determine whether an artifact exists', async () => {
+    const fixture = createFixture();
+    const inspectionError = new Error('rollback directory became unreadable');
+    fixture.fileSystem.failExists(
+      '/sqlite/app.db.rollback-clear-restore-id',
+      inspectionError,
+    );
+
+    await expect(fixture.service.clear()).rejects.toMatchObject({
+      name: 'DatabaseRecoveryRequiredError',
+    });
+
+    expect(fixture.database.markRecoveryRequired).toHaveBeenCalledWith(expect.objectContaining({
+      errors: expect.arrayContaining([inspectionError]),
+    }));
+    expect(fixture.events).toContain('database-close-reopened');
+    expect(fixture.events).not.toContain('journal-cleared');
+  });
+
+  test('keeps recovery armed and closes the empty handle if old media cannot be retired', async () => {
+    const fixture = createFixture();
+    const retirementError = new Error('old media directory is locked');
+    fixture.fileSystem.failDelete(
+      'file:///documents/media.rollback-clear-restore-id',
+      retirementError,
+    );
+
+    await expect(fixture.service.clear()).rejects.toMatchObject({
+      name: 'DatabaseRecoveryRequiredError',
+    });
+
+    expect(fixture.database.markRecoveryRequired).toHaveBeenCalledWith(expect.objectContaining({
+      errors: expect.arrayContaining([retirementError]),
+    }));
+    expect(fixture.events).toContain('database-close-reopened');
+    expect(fixture.events).not.toContain('journal-cleared');
+    expect(fixture.fileSystem.exists('file:///documents/media.rollback-clear-restore-id')).toBe(true);
+  });
+
+  test('does not follow a stale external reference while clearing the private media root', async () => {
     const fixture = createFixture();
     fixture.records.list = jest.fn<
       ReturnType<RecordRepository['list']>,
@@ -482,7 +757,8 @@ describe('BackupService clear', () => {
     }]);
 
     await expect(fixture.service.clear()).resolves.toMatchObject({ cleanupPending: false });
-    expect(fixture.media.remove).toHaveBeenCalledWith(['file:///outside/photo.jpg']);
+    expect(fixture.media.remove).not.toHaveBeenCalled();
+    expect(fixture.media.removeOrphans).not.toHaveBeenCalled();
   });
 
   test('removes sidecars created by a failed empty-database open before restoring and reopening', async () => {
@@ -494,9 +770,12 @@ describe('BackupService clear', () => {
     await expect(fixture.service.clear()).rejects.toThrow('empty database failed to open');
 
     await expect(fixture.fileSystem.readBytes('/sqlite/app.db')).resolves.toEqual(OLD_DATABASE);
+    await expect(fixture.fileSystem.readBytes('file:///documents/media/old.jpg'))
+      .resolves.toEqual(bytes('old photo'));
+    expect(fixture.fileSystem.exists('file:///documents/media.rollback-clear-restore-id')).toBe(false);
     expect(fixture.fileSystem.exists('/sqlite/app.db-wal')).toBe(false);
     expect(fixture.fileSystem.exists('/sqlite/app.db-shm')).toBe(false);
-    expect(fixture.database.reopen).toHaveBeenCalledTimes(1);
+    expect(fixture.events).toContain('journal-cleared');
   });
 
   test('keeps the database closed when clear rollback cannot restore a complete file set', async () => {
@@ -584,14 +863,18 @@ type FixtureOptions = {
 
 function createFixture(options: FixtureOptions = {}) {
   const events: string[] = [];
-  const fileSystem = new MemoryBackupFileSystem();
+  const maintenance = createMaintenanceCoordinator();
+  const fileSystem = new MemoryBackupFileSystem(events);
   fileSystem.seedFile('/sqlite/app.db', OLD_DATABASE);
   fileSystem.seedFile('file:///documents/media/old.jpg', bytes('old photo'));
   fileSystem.seedFile('file:///documents/media/photo.jpg', PHOTO);
-  const markRecoveryRequired = jest.fn((cause: unknown) => new DatabaseRecoveryRequiredError(
-    'Local data recovery is required before the database can be reopened.',
-    cause,
-  ));
+  const markRecoveryRequired = jest.fn((cause: unknown) => {
+    events.push('recovery-required');
+    return new DatabaseRecoveryRequiredError(
+      'Local data recovery is required before the database can be reopened.',
+      cause,
+    );
+  });
   const withClosedDatabase = jest.fn(async (work: (databasePath: string) => Promise<unknown>) => {
     events.push('database-close-current');
     try {
@@ -617,6 +900,53 @@ function createFixture(options: FixtureOptions = {}) {
       throw cause;
     }
   });
+  const withRecoveryJournal = jest.fn(async (
+    _journal: { operation: 'restore' | 'clear' | 'manual'; operationId: string },
+    work: (context: {
+      databasePath: string;
+      reopen(): Promise<SQLiteDatabase>;
+      closeReopened(): Promise<void>;
+    }) => Promise<unknown>,
+  ) => {
+    events.push('journal-armed');
+    events.push('database-close-current');
+    let reopenAttempts = 0;
+    let safelyReopened = false;
+    const reopen = async () => {
+      reopenAttempts += 1;
+      if (reopenAttempts === 1 && options.automaticReopenFailure !== undefined) {
+        events.push('database-reopen-failed');
+        if (options.dropWalRollbackBeforeFailure === true) {
+          fileSystem.deleteNow('/sqlite/app.db-wal.rollback-restore-id');
+        }
+        if (options.createCandidateSidecars === true) {
+          fileSystem.seedFile('/sqlite/app.db-wal', bytes('candidate wal'));
+          fileSystem.seedFile('/sqlite/app.db-shm', bytes('candidate shm'));
+        }
+        throw options.automaticReopenFailure;
+      }
+      safelyReopened = true;
+      events.push('database-reopen');
+      return {} as SQLiteDatabase;
+    };
+    const closeReopened = async () => {
+      safelyReopened = false;
+      events.push('database-close-reopened');
+    };
+    try {
+      const result = await work({ closeReopened, databasePath: '/sqlite/app.db', reopen });
+      if (!safelyReopened) {
+        throw new Error('Recovery work did not safely reopen the database.');
+      }
+      events.push('journal-cleared');
+      return result;
+    } catch (cause) {
+      if (safelyReopened) {
+        events.push('journal-cleared');
+      }
+      throw cause;
+    }
+  });
   const database: DatabaseManager = {
     initialize: jest.fn(),
     reopen: jest.fn(async () => {
@@ -624,6 +954,7 @@ function createFixture(options: FixtureOptions = {}) {
       return {} as never;
     }),
     withClosedDatabase: withClosedDatabase as DatabaseManager['withClosedDatabase'],
+    withRecoveryJournal: withRecoveryJournal as DatabaseManager['withRecoveryJournal'],
     markRecoveryRequired,
     getLifecycleSnapshot: jest.fn(() => ({ status: 'closed' })),
     subscribe: jest.fn(() => () => undefined),
@@ -647,6 +978,7 @@ function createFixture(options: FixtureOptions = {}) {
     delete: jest.fn(),
     get: jest.fn(),
     withTransaction: jest.fn(),
+    listPage: jest.fn(async () => ({ records: [], nextCursor: null })),
     list: jest.fn<ReturnType<RecordRepository['list']>, Parameters<RecordRepository['list']>>(
       async () => [{
       id: 'record-1',
@@ -671,8 +1003,12 @@ function createFixture(options: FixtureOptions = {}) {
     stage: jest.fn(),
     commit: jest.fn(),
     rollback: jest.fn(),
-    remove: jest.fn<Promise<void>, [string[]]>(async () => undefined),
-    removeOrphans: jest.fn<Promise<void>, [string[]]>(async () => undefined),
+    remove: jest.fn<Promise<void>, [string[]]>(async () => {
+      events.push('media-remove');
+    }),
+    removeOrphans: jest.fn<Promise<void>, [string[]]>(async () => {
+      events.push('orphan-cleanup');
+    }),
   };
   const manifest = {
     format: 'baby-growth-backup',
@@ -731,6 +1067,7 @@ function createFixture(options: FixtureOptions = {}) {
     fileSystem,
     hashFile,
     media,
+    maintenance,
     now: () => new Date('2026-08-01T12:00:00.000Z'),
     pickArchive: jest.fn(async () => 'file:///picker/valid.zip'),
     records,
@@ -746,6 +1083,7 @@ function createFixture(options: FixtureOptions = {}) {
     events,
     fileSystem,
     media,
+    maintenance,
     records,
     readSnapshotMediaPaths,
     service,
@@ -766,7 +1104,13 @@ class MemoryBackupFileSystem implements BackupFileSystem {
   ]);
   private readonly moveToFailures = new Map<string, Error>();
   private readonly copyToFailures = new Map<string, Error>();
+  private readonly deleteFailures = new Map<string, Error>();
+  private readonly deleteObservers = new Map<string, () => void>();
+  private readonly existsFailures = new Map<string, Error>();
+  private readonly syncFailures = new Map<string, Error>();
   private readonly moveFromFailures: Array<{ pattern: RegExp; error: Error }> = [];
+
+  constructor(private readonly events: string[] = []) {}
 
   availableDiskSpace = jest.fn(() => 1_000_000);
 
@@ -788,11 +1132,34 @@ class MemoryBackupFileSystem implements BackupFileSystem {
     this.copyToFailures.set(path, error);
   }
 
+  failDelete(path: string, error: Error): void {
+    this.deleteFailures.set(path, error);
+  }
+
+  failExists(path: string, error: Error): void {
+    this.existsFailures.set(path, error);
+  }
+
+  failSync(path: string, error: Error): void {
+    this.syncFailures.set(path, error);
+  }
+
+  observeDelete(path: string, observer: () => void): void {
+    this.deleteObservers.set(path, observer);
+  }
+
   failMoveFromMatching(pattern: RegExp, error: Error): void {
     this.moveFromFailures.push({ pattern, error });
   }
 
-  exists = jest.fn((path: string) => this.files.has(path) || this.directories.has(path));
+  exists = jest.fn((path: string) => {
+    const failure = this.existsFailures.get(path);
+    if (failure !== undefined) {
+      this.existsFailures.delete(path);
+      throw failure;
+    }
+    return this.files.has(path) || this.directories.has(path);
+  });
   size = jest.fn((path: string) => this.files.get(path)?.length ?? 0);
   openRead = jest.fn(async (path: string): Promise<BackupFileReader> => {
     const value = this.files.get(path);
@@ -815,6 +1182,28 @@ class MemoryBackupFileSystem implements BackupFileSystem {
   ensureDirectory = jest.fn(async (path: string) => {
     this.ensureParents(path);
     this.directories.add(path);
+  });
+  syncFile = jest.fn(async (path: string) => {
+    this.events.push(`sync-file:${path}`);
+    const failure = this.syncFailures.get(path);
+    if (failure !== undefined) {
+      this.syncFailures.delete(path);
+      throw failure;
+    }
+    if (!this.files.has(path)) {
+      throw new Error(`Missing file: ${path}`);
+    }
+  });
+  syncDirectory = jest.fn(async (path: string) => {
+    this.events.push(`sync-directory:${path}`);
+    const failure = this.syncFailures.get(path);
+    if (failure !== undefined) {
+      this.syncFailures.delete(path);
+      throw failure;
+    }
+    if (!this.directories.has(path)) {
+      throw new Error(`Missing directory: ${path}`);
+    }
   });
   copyFile = jest.fn(async (source: string, target: string) => {
     const value = await this.readBytes(source);
@@ -859,6 +1248,13 @@ class MemoryBackupFileSystem implements BackupFileSystem {
     }
   });
   delete = jest.fn(async (path: string) => {
+    this.events.push(`delete:${path}`);
+    this.deleteObservers.get(path)?.();
+    const failure = this.deleteFailures.get(path);
+    if (failure !== undefined) {
+      this.deleteFailures.delete(path);
+      throw failure;
+    }
     this.files.delete(path);
     for (const file of [...this.files.keys()]) {
       if (file.startsWith(`${path}/`)) {
@@ -935,6 +1331,7 @@ type ZipFixtureEntry = {
   localUncompressedSize?: number;
   centralExtra?: number[];
   localExtra?: number[];
+  data?: number[];
 };
 
 function zipFixture(entries: ZipFixtureEntry[]): Uint8Array {
@@ -958,6 +1355,7 @@ function zipFixture(entries: ZipFixtureEntry[]): Uint8Array {
     pushU16(chunks, extra.length);
     chunks.push(...name);
     chunks.push(...extra);
+    chunks.push(...(entry.data ?? []));
   }
   const centralOffset = chunks.length;
   entries.forEach((entry, index) => {
@@ -1093,4 +1491,17 @@ function pushU16(target: number[], value: number): void {
 function pushU32(target: number[], value: number): void {
   pushU16(target, value & 0xffff);
   pushU16(target, (value >>> 16) & 0xffff);
+}
+
+function pushU64(target: number[], value: number): void {
+  pushU32(target, value % 0x1_0000_0000);
+  pushU32(target, Math.floor(value / 0x1_0000_0000));
+}
+
+function zip64Extra(values: number[]): number[] {
+  const data: number[] = [];
+  for (const value of values) {
+    pushU64(data, value);
+  }
+  return [0x01, 0x00, data.length & 0xff, data.length >>> 8, ...data];
 }

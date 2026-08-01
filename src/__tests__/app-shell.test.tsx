@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react-native';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 
 import AddScreen from '../../app/(tabs)/add';
 import BabyScreen from '../../app/(tabs)/baby';
@@ -10,7 +10,26 @@ import { RecordRepositoryProvider } from '../features/records/RecordRepositoryPr
 import { babyInputFixture } from '../test/fixtures';
 import { MemoryBabyRepository, MemoryRecordRepository } from '../test/memoryRepositories';
 
-test('shows the empty timeline action', async () => {
+const mockPush = jest.fn();
+const mockReplace = jest.fn();
+
+jest.mock('expo-router', () => ({
+  useRouter: () => ({ push: mockPush, replace: mockReplace }),
+}));
+
+jest.mock('expo-video', () => {
+  const { View } = require('react-native') as typeof import('react-native');
+  return {
+    useVideoPlayer: () => ({ play: jest.fn() }),
+    VideoView: (props: Record<string, unknown>) => <View {...props} />,
+  };
+});
+
+beforeEach(() => {
+  jest.clearAllMocks();
+});
+
+test('opens the add-record route from the empty timeline action', async () => {
   const babyRepository = new MemoryBabyRepository();
   await babyRepository.save(babyInputFixture());
   const recordRepository = new MemoryRecordRepository();
@@ -24,7 +43,9 @@ test('shows the empty timeline action', async () => {
   );
 
   await waitFor(() => expect(screen.getByText('还没有成长记录')).toBeTruthy());
-  expect(screen.getByText('记录第一个瞬间')).toBeTruthy();
+  fireEvent.press(screen.getByRole('button', { name: '记录第一个瞬间' }));
+
+  expect(mockPush).toHaveBeenCalledWith('/(tabs)/add');
 });
 
 test('shows the add-record prompt', async () => {

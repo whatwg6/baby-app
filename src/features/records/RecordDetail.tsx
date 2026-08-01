@@ -1,11 +1,23 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import {
+  KeyboardAvoidingView,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
 
 import type { RecordRepository } from '../../data/repositories';
 import type { ActivityDetails, GrowthDetails, MilestoneDetails, TimelineRecord } from '../../domain/types';
 import { colors, radius, spacing } from '../../ui/theme';
 import { MediaPreview } from '../media/MediaPreview';
-import { mediaService, type MediaService } from '../media/mediaService';
+import {
+  mediaService,
+  type MediaCleanupIssue,
+  type MediaService,
+} from '../media/mediaService';
 import { recordTypeLabel } from '../timeline/TimelineCard';
 import { DeleteRecordButton } from './DeleteRecordButton';
 
@@ -16,12 +28,14 @@ export function RecordDetail({
   recordId,
   onEdit,
   onDelete,
+  onCleanupPending,
   media = mediaService,
 }: {
   repository: RecordRepository;
   recordId: string;
   onEdit?(target: string): void;
   onDelete?(): void;
+  onCleanupPending?(issue: MediaCleanupIssue): void;
   media?: MediaService;
 }) {
   const [record, setRecord] = useState<TimelineRecord | null>(null);
@@ -64,39 +78,52 @@ export function RecordDetail({
   }
 
   return (
-    <View style={styles.container}>
-      {error === null ? null : <RetryState onRetry={reload} />}
-      <Text style={styles.type}>{recordTypeLabel(record.type)}</Text>
-      <Text style={styles.date}>{formatOccurredAt(record.occurredAt)}</Text>
-      <RecordDetails record={record} />
-      {record.note?.trim() ? <Text style={styles.note}>{record.note}</Text> : null}
-      <View style={styles.attachments}>
-        {record.attachments.map((attachment) => (
-          <MediaPreview
-            accessibilityLabel="记录媒体"
-            key={attachment.id}
-            mediaType={attachment.mediaType}
-            uri={attachment.thumbnailPath ?? attachment.filePath}
+    <KeyboardAvoidingView
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      style={styles.keyboardAvoiding}
+      testID="record-detail-keyboard-avoiding"
+    >
+      <ScrollView
+        contentContainerStyle={styles.container}
+        keyboardShouldPersistTaps="handled"
+        testID="record-detail-scroll"
+      >
+        {error === null ? null : <RetryState onRetry={reload} />}
+        <Text style={styles.type}>{recordTypeLabel(record.type)}</Text>
+        <Text style={styles.date}>{formatOccurredAt(record.occurredAt)}</Text>
+        <RecordDetails record={record} />
+        {record.note?.trim() ? <Text style={styles.note}>{record.note}</Text> : null}
+        <View style={styles.attachments}>
+          {record.attachments.map((attachment) => (
+            <MediaPreview
+              accessibilityLabel="记录媒体"
+              key={attachment.id}
+              mediaType={attachment.mediaType}
+              uri={attachment.mediaType === 'video'
+                ? attachment.filePath
+                : attachment.thumbnailPath ?? attachment.filePath}
+            />
+          ))}
+        </View>
+        <View style={styles.actions}>
+          <Pressable
+            accessibilityRole="button"
+            onPress={() => onEdit?.(`/record/edit/${record.id}`)}
+            style={styles.editAction}
+          >
+            <Text style={styles.editActionText}>编辑</Text>
+          </Pressable>
+          <DeleteRecordButton
+            disabled={onDelete === undefined}
+            media={media}
+            onCleanupPending={onCleanupPending}
+            onDeleted={onDelete}
+            recordId={record.id}
+            repository={repository}
           />
-        ))}
-      </View>
-      <View style={styles.actions}>
-        <Pressable
-          accessibilityRole="button"
-          onPress={() => onEdit?.(`/record/edit/${record.id}`)}
-          style={styles.editAction}
-        >
-          <Text style={styles.editActionText}>编辑</Text>
-        </Pressable>
-        <DeleteRecordButton
-          disabled={onDelete === undefined}
-          media={media}
-          onDeleted={onDelete}
-          recordId={record.id}
-          repository={repository}
-        />
-      </View>
-    </View>
+        </View>
+      </ScrollView>
+    </KeyboardAvoidingView>
   );
 }
 
@@ -162,7 +189,8 @@ function formatOccurredAt(occurredAt: string): string {
 }
 
 const styles = StyleSheet.create({
-  container: { backgroundColor: colors.background, flex: 1, gap: spacing.md, padding: spacing.lg },
+  keyboardAvoiding: { backgroundColor: colors.background, flex: 1 },
+  container: { flexGrow: 1, gap: spacing.md, padding: spacing.lg },
   status: { color: colors.muted, fontSize: 16, padding: spacing.lg },
   errorState: { gap: spacing.xs },
   error: { color: colors.danger, fontSize: 16 },

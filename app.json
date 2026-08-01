@@ -4,6 +4,9 @@
     "slug": "baby-growth-timeline",
     "version": "1.0.0",
     "scheme": "babygrowth",
+    "autolinking": {
+      "nativeModulesDir": "./modules"
+    },
     "plugins": [
       [
         "expo-router",

@@ -1,11 +1,12 @@
 import { act, fireEvent, render, waitFor } from '@testing-library/react-native';
 
-import EditRecordRoute from '../../../../app/record/edit/[id]';
+import EditRecordRoute, { EditRecordScreen } from '../../../../app/record/edit/[id]';
+import { AppProvider, type AppServices } from '../../../app/AppProvider';
 import type { RecordRepository, RecordTransaction } from '../../../data/repositories';
 import type { NewRecordInput, TimelineRecord } from '../../../domain/types';
+import type { BackupService } from '../../backup/backupService';
 import type { MediaService, StagedMedia } from '../../media/mediaService';
-import { RecordRepositoryProvider } from '../RecordRepositoryProvider';
-import { MemoryRecordRepository } from '../../../test/memoryRepositories';
+import { MemoryBabyRepository, MemoryRecordRepository } from '../../../test/memoryRepositories';
 
 let mockRouteId = 'first';
 const mockReplace = jest.fn();
@@ -118,9 +119,11 @@ test('navigates after save and warns distinctly when old-media cleanup is pendin
   const showCleanupPending = jest.fn();
   const repository = createRepository(get, update);
   const view = await render(
-    <RecordRepositoryProvider repository={repository}>
-      <EditRecordRoute media={media} showCleanupPending={showCleanupPending} />
-    </RecordRepositoryProvider>,
+    <EditRecordScreen
+      media={media}
+      repository={repository}
+      showCleanupPending={showCleanupPending}
+    />,
   );
   await waitFor(() => expect(view.getByLabelText('备注（可选）').props.value).toBe('第一条记录'));
 
@@ -132,16 +135,73 @@ test('navigates after save and warns distinctly when old-media cleanup is pendin
   expect(view.queryByText('保存失败，已有数据未受影响')).toBeNull();
 });
 
+test('uses AppServices guarded media and durable warning handling in the production route', async () => {
+  const record = momentRecord('first', '第一条记录', [{
+    id: 'old-attachment',
+    recordId: 'first',
+    mediaType: 'image',
+    filePath: 'file:///documents/media/old.jpg',
+    thumbnailPath: null,
+    createdAt: '2026-07-01T00:00:00.000Z',
+  }]);
+  const repository = createRepository(
+    jest.fn(async () => record),
+    jest.fn(async (id, input) => ({
+      ...momentRecord(id, input.note ?? ''),
+      attachments: [],
+    })),
+  );
+  const media = routeMedia();
+  media.remove.mockRejectedValue(new Error('old media is locked'));
+  const reportCleanupWarning = jest.fn();
+  const services = appServices(repository, media, reportCleanupWarning);
+  const view = await render(
+    <AppProvider services={services}>
+      <EditRecordRoute />
+    </AppProvider>,
+  );
+  await waitFor(() => expect(view.getByLabelText('备注（可选）').props.value).toBe('第一条记录'));
+
+  await fireEvent.press(view.getByRole('button', { name: '移除' }));
+  await fireEvent.press(view.getByRole('button', { name: '保存' }));
+
+  await waitFor(() => expect(mockReplace).toHaveBeenCalledWith('/record/first'));
+  expect(media.remove).toHaveBeenCalledWith(['file:///documents/media/old.jpg']);
+  expect(reportCleanupWarning).toHaveBeenCalledWith('已保存，旧媒体将在稍后清理');
+});
+
 function routeTree(repository: RecordRepository) {
   return (
-    <RecordRepositoryProvider repository={repository}>
-      <EditRecordRoute />
-    </RecordRepositoryProvider>
+    <EditRecordScreen
+      media={routeMedia()}
+      repository={repository}
+      showCleanupPending={jest.fn()}
+    />
   );
 }
 
 function renderRoute(repository: RecordRepository) {
   return render(routeTree(repository));
+}
+
+function appServices(
+  records: RecordRepository,
+  media: MediaService,
+  reportCleanupWarning: AppServices['reportCleanupWarning'],
+): AppServices {
+  return {
+    babies: new MemoryBabyRepository(),
+    records,
+    media,
+    backup: {
+      export: jest.fn(),
+      inspect: jest.fn(),
+      restore: jest.fn(),
+      clear: jest.fn(),
+    } as jest.Mocked<BackupService>,
+    database: {} as AppServices['database'],
+    reportCleanupWarning,
+  };
 }
 
 function createRepository(
@@ -163,6 +223,7 @@ function createRepository(
     delete: (id) => memory.delete(id),
     get,
     list: (filter) => memory.list(filter),
+    listPage: (options) => memory.listPage(options),
     withTransaction: (work) => work(transaction),
   };
 }

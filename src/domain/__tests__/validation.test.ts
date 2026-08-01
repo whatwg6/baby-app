@@ -78,15 +78,19 @@ describe('parseRecordDraft', () => {
     ).toThrow();
   });
 
-  test('requires an activity detail and meaningful activity content', () => {
-    expect(() =>
-      parseRecordDraft({
-        type: 'activity',
-        occurredAt,
-        note: null,
-        details: { activityType: 'feeding', amount: null, durationMinutes: null },
-        attachments: [],
-      }),
-    ).toThrow();
+  test('accepts an activity type when amount, duration, and note are all omitted', () => {
+    expect(parseRecordDraft({
+      type: 'activity',
+      occurredAt,
+      note: null,
+      details: { activityType: 'feeding', amount: null, durationMinutes: null },
+      attachments: [],
+    })).toEqual({
+      type: 'activity',
+      occurredAt,
+      note: null,
+      details: { activityType: 'feeding', amount: null, durationMinutes: null },
+      attachments: [],
+    });
   });
 });

@@ -111,7 +111,9 @@ describe('DeleteRecordButton', () => {
       await Promise.resolve();
     });
 
-    await waitFor(() => expect(view.getByText('删除失败（数据库阶段），请重试')).toBeTruthy());
+    await waitFor(() => expect(
+      view.getByText('删除失败（数据库阶段）：database is locked，请重试'),
+    ).toBeTruthy());
     expect(media.remove).not.toHaveBeenCalled();
   });
 });
@@ -122,6 +124,7 @@ function dependencies(events: string[] = []) {
     update: jest.fn(),
     get: jest.fn(),
     list: jest.fn(),
+    listPage: jest.fn(),
     withTransaction: jest.fn(),
     delete: jest.fn<ReturnType<RecordRepository['delete']>, Parameters<RecordRepository['delete']>>(
       async () => {

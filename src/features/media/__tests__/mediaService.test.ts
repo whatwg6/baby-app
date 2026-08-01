@@ -1,5 +1,4 @@
 import type {
-  BabyRepository,
   RecordRepository,
   RecordTransaction,
 } from '../../../data/repositories';
@@ -152,6 +151,50 @@ describe('media service lifecycle', () => {
     await expect(service.commit(staged)).rejects.toThrow('thumbnail move failed');
 
     expect(fs.delete).toHaveBeenCalledWith(staged.finalPath);
+  });
+
+  test.each([
+    'file:///documents/media/../outside.jpg',
+    'file:///documents/media/%2e%2e/outside.jpg',
+    'file:///documents/media/%252e%252e/outside.jpg',
+    'file:///documents/media%2f..%2foutside.jpg',
+    'file:///documents/media/folder%2Fphoto.jpg',
+    'file:///documents/media/folder%255Cphoto.jpg',
+    'file:///documents/media-sibling/outside.jpg',
+    'file://evil/documents/media/outside.jpg',
+    'https://documents/media/outside.jpg',
+  ])('rejects unsafe owned-media path %s before filesystem access', async (path) => {
+    const fs = createFileSystem();
+    const service = createMediaService({ fileSystem: fs, createId: () => 'unused' });
+
+    await expect(service.remove([path])).rejects.toMatchObject({
+      code: 'unsafe-path',
+    });
+
+    expect(fs.delete).not.toHaveBeenCalled();
+  });
+
+  test('rejects a tampered staged path before committing any file', async () => {
+    const fs = createFileSystem();
+    const service = createMediaService({ fileSystem: fs, createId: () => 'unused' });
+
+    await expect(service.commit({
+      ...stagedImage(),
+      stagingPath: 'file:///documents/staging/%2e%2e/private.jpg',
+    })).rejects.toMatchObject({ code: 'unsafe-path' });
+
+    expect(fs.move).not.toHaveBeenCalled();
+  });
+
+  test('rejects unsafe database references before orphan containment checks', async () => {
+    const fs = createFileSystem();
+    const service = createMediaService({ fileSystem: fs, createId: () => 'unused' });
+
+    await expect(service.removeOrphans([
+      'file:///documents/media/../outside.jpg',
+    ])).rejects.toMatchObject({ code: 'unsafe-path' });
+
+    expect(fs.delete).not.toHaveBeenCalled();
   });
 });
 
@@ -320,32 +363,15 @@ describe('record media transaction coordination', () => {
 
 test('orphan cleanup collects baby avatar, attachment, and thumbnail references', async () => {
   const media = createMockMedia(stagedImage(), []);
-  const babyRepository: BabyRepository = {
-    get: jest.fn(async () => ({
-      id: 'baby-1',
-      name: '安安',
-      birthDate: '2025-06-15',
-      sex: null,
-      avatarPath: 'file:///documents/media/avatar.jpg',
-      createdAt: '2026-07-01T00:00:00.000Z',
-      updatedAt: '2026-07-01T00:00:00.000Z',
-    })),
-    save: jest.fn(),
-    clear: jest.fn(),
+  const mediaReferences = {
+    listReferencedMediaPaths: jest.fn(async () => [
+      'file:///documents/media/avatar.jpg',
+      'file:///documents/media/photo.jpg',
+      'file:///documents/media/photo-thumb.jpg',
+    ]),
   };
-  const records = createRecordRepository([], undefined, null);
-  records.list = jest.fn(async () => [timelineRecord({
-    attachments: [{
-      id: 'attachment-1',
-      recordId: 'record-1',
-      mediaType: 'image',
-      filePath: 'file:///documents/media/photo.jpg',
-      thumbnailPath: 'file:///documents/media/photo-thumb.jpg',
-      createdAt: '2026-07-01T00:00:00.000Z',
-    }],
-  })]);
 
-  await removeUnreferencedMedia({ babies: babyRepository, records, media });
+  await removeUnreferencedMedia({ mediaReferences, media });
 
   expect(media.removeOrphans).toHaveBeenCalledWith([
     'file:///documents/media/avatar.jpg',
@@ -414,6 +440,7 @@ function createRecordRepository(
     update: transaction.update,
     delete: transaction.delete,
     list: jest.fn(async () => []),
+    listPage: jest.fn(async () => ({ records: [], nextCursor: null })),
     get: jest.fn(async () => {
       events.push('record-load');
       return existing;

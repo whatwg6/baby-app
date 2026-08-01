@@ -5,7 +5,6 @@ import type { SQLiteDatabase } from 'expo-sqlite';
 
 import { createDatabaseManager } from '../../data/database';
 import type { SQLiteRepositories } from '../../data/repositories';
-import type { Baby, TimelineRecord } from '../../domain/types';
 import type { BackupService } from '../../features/backup/backupService';
 import type { MediaService } from '../../features/media/mediaService';
 import { useBaby } from '../../features/baby/useBaby';
@@ -14,6 +13,7 @@ import { MemoryBabyRepository, MemoryRecordRepository } from '../../test/memoryR
 import { AppErrorBoundary } from '../AppErrorBoundary';
 import { AppProvider, useAppServices, type AppServices } from '../AppProvider';
 import { initializeApp } from '../initializeApp';
+import { createMaintenanceCoordinator } from '../maintenance';
 
 jest.mock('expo-sqlite', () => ({
   openDatabaseAsync: jest.fn(),
@@ -35,24 +35,21 @@ test('initializes storage, database, cleanup, and stable services in dependency 
     events.push('open-database');
     return sqlite;
   });
-  const baby = { avatarPath: 'file:///documents/media/avatar.jpg' } as Baby;
-  const record = {
-    attachments: [{
-      filePath: 'file:///documents/media/photo.jpg',
-      thumbnailPath: 'file:///documents/media/photo-thumb.jpg',
-    }],
-  } as TimelineRecord;
   const repositories = {
     babies: {
-      get: jest.fn(async () => {
-        events.push('read-baby');
-        return baby;
-      }),
+      get: jest.fn(async () => null),
     },
     records: {
-      list: jest.fn(async () => {
-        events.push('read-records');
-        return [record];
+      list: jest.fn(async () => []),
+    },
+    mediaReferences: {
+      listReferencedMediaPaths: jest.fn(async () => {
+        events.push('read-media-references');
+        return [
+          'file:///documents/media/avatar.jpg',
+          'file:///documents/media/photo.jpg',
+          'file:///documents/media/photo-thumb.jpg',
+        ];
       }),
     },
   } as unknown as SQLiteRepositories;
@@ -62,6 +59,7 @@ test('initializes storage, database, cleanup, and stable services in dependency 
     }),
   } as unknown as MediaService;
   const backup = {} as BackupService;
+  const maintenance = createMaintenanceCoordinator();
 
   const services = await initializeApp({
     database,
@@ -76,6 +74,7 @@ test('initializes storage, database, cleanup, and stable services in dependency 
     },
     repositoryFactory: () => repositories,
     backupFactory: () => backup,
+    maintenance,
   });
   events.push('return-services');
 
@@ -84,23 +83,32 @@ test('initializes storage, database, cleanup, and stable services in dependency 
     'open-database',
     'migrate',
     'clear-staging',
-    'read-baby',
-    'read-records',
+    'read-media-references',
     'remove-orphans',
     'return-services',
   ]);
+  expect(repositories.babies.get).not.toHaveBeenCalled();
+  expect(repositories.records.list).not.toHaveBeenCalled();
   expect(media.removeOrphans).toHaveBeenCalledWith([
     'file:///documents/media/avatar.jpg',
     'file:///documents/media/photo.jpg',
     'file:///documents/media/photo-thumb.jpg',
   ]);
-  expect(services).toEqual({
+  expect(services).toMatchObject({
     babies: repositories.babies,
     records: repositories.records,
-    media,
     backup,
     database,
   });
+  expect(services.media).toEqual(expect.objectContaining({
+    stage: expect.any(Function),
+    commit: expect.any(Function),
+    rollback: expect.any(Function),
+    remove: expect.any(Function),
+    removeOrphans: expect.any(Function),
+  }));
+  services.reportCleanupWarning('记录已删除，媒体将在稍后清理');
+  expect(maintenance.getSnapshot().warning).toBe('记录已删除，媒体将在稍后清理');
 });
 
 test('provides the same stable service instances to the app and feature consumers', async () => {
@@ -113,6 +121,7 @@ test('provides the same stable service instances to the app and feature consumer
     media,
     backup: {} as BackupService,
     database: {} as AppServices['database'],
+    reportCleanupWarning: jest.fn(),
   };
 
   function Consumer() {

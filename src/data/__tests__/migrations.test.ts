@@ -6,6 +6,7 @@ jest.mock('expo-sqlite', () => ({
 
 import {
   createDatabaseManager,
+  type DatabaseManager,
   type RecoverySentinelStore,
 } from '../database';
 import { migrateDatabase } from '../migrations';
@@ -106,6 +107,8 @@ class MemoryRecoverySentinelStore implements RecoverySentinelStore {
   required = false;
   readError: Error | null = null;
   writeError: Error | null = null;
+  clearError: Error | null = null;
+  readonly events: string[] = [];
 
   isRecoveryRequired = jest.fn(() => {
     if (this.readError !== null) {
@@ -115,12 +118,32 @@ class MemoryRecoverySentinelStore implements RecoverySentinelStore {
   });
 
   markRecoveryRequired = jest.fn(() => {
+    this.events.push('journal-armed');
     if (this.writeError !== null) {
       throw this.writeError;
     }
     this.required = true;
   });
+
+  clearRecoveryRequired = jest.fn(() => {
+    this.events.push('journal-cleared');
+    if (this.clearError !== null) {
+      throw this.clearError;
+    }
+    this.required = false;
+  });
 }
+
+type RecoveryJournalManager = DatabaseManager & {
+  withRecoveryJournal<T>(
+    journal: { operation: 'restore' | 'clear'; operationId: string },
+    work: (context: {
+      databasePath: string;
+      reopen(): Promise<SQLiteDatabase>;
+      closeReopened(): Promise<void>;
+    }) => Promise<T>,
+  ): Promise<T>;
+};
 
 function asSQLiteDatabase(database: MigrationDatabase): SQLiteDatabase {
   return database as unknown as SQLiteDatabase;
@@ -434,5 +457,133 @@ describe('DatabaseManager.withClosedDatabase', () => {
       'open:fresh',
       'service-continued',
     ]);
+  });
+});
+
+describe('DatabaseManager.withRecoveryJournal', () => {
+  test('arms the durable journal before replacement work and clears it only after safe reopen', async () => {
+    const store = new MemoryRecoverySentinelStore();
+    const first = new MigrationDatabase();
+    const reopened = new MigrationDatabase();
+    const openDatabase = jest
+      .fn<Promise<SQLiteDatabase>, [string]>()
+      .mockResolvedValueOnce(asSQLiteDatabase(first))
+      .mockImplementationOnce(async () => {
+        store.events.push('database-reopened');
+        return asSQLiteDatabase(reopened);
+      });
+    const manager = createDatabaseManager(
+      'baby-growth.db',
+      openDatabase,
+      store,
+    ) as RecoveryJournalManager;
+
+    await expect(manager.withRecoveryJournal(
+      { operation: 'restore', operationId: 'restore-1' },
+      async ({ databasePath, reopen }) => {
+        expect(databasePath).toBe('/documents/baby-growth.db');
+        expect(store.required).toBe(true);
+        store.events.push('replacement-work');
+        await reopen();
+        expect(store.required).toBe(true);
+        return 'installed';
+      },
+    )).resolves.toBe('installed');
+
+    expect(store.events).toEqual([
+      'journal-armed',
+      'replacement-work',
+      'database-reopened',
+      'journal-cleared',
+    ]);
+    expect(store.required).toBe(false);
+    expect(manager.getLifecycleSnapshot()).toMatchObject({ status: 'open' });
+  });
+
+  test('aborts before replacement work when the journal cannot be persisted', async () => {
+    const store = new MemoryRecoverySentinelStore();
+    store.writeError = new Error('journal write denied');
+    const first = new MigrationDatabase();
+    const openDatabase = jest.fn(async () => asSQLiteDatabase(first));
+    const manager = createDatabaseManager(
+      'baby-growth.db',
+      openDatabase,
+      store,
+    ) as RecoveryJournalManager;
+    const work = jest.fn();
+
+    await expect(manager.withRecoveryJournal(
+      { operation: 'clear', operationId: 'clear-1' },
+      work,
+    )).rejects.toThrow('journal write denied');
+
+    expect(work).not.toHaveBeenCalled();
+    expect(manager.getLifecycleSnapshot()).toMatchObject({ status: 'recovery-required' });
+  });
+
+  test('closes a safely reopened handle before latching recovery-required cleanup failure', async () => {
+    const store = new MemoryRecoverySentinelStore();
+    const first = new MigrationDatabase();
+    const reopened = new MigrationDatabase();
+    const openDatabase = jest
+      .fn<Promise<SQLiteDatabase>, [string]>()
+      .mockResolvedValueOnce(asSQLiteDatabase(first))
+      .mockResolvedValueOnce(asSQLiteDatabase(reopened));
+    const manager = createDatabaseManager(
+      'baby-growth.db',
+      openDatabase,
+      store,
+    ) as RecoveryJournalManager;
+    const retirementError = new Error('old rollback deletion failed');
+
+    await expect(manager.withRecoveryJournal(
+      { operation: 'clear', operationId: 'clear-retirement' },
+      async ({ closeReopened, reopen }) => {
+        await reopen();
+        await closeReopened();
+        throw manager.markRecoveryRequired(retirementError);
+      },
+    )).rejects.toMatchObject({
+      name: 'DatabaseRecoveryRequiredError',
+      cause: retirementError,
+    });
+
+    expect(reopened.closed).toBe(true);
+    expect(store.required).toBe(true);
+    expect(store.clearRecoveryRequired).not.toHaveBeenCalled();
+    expect(manager.getLifecycleSnapshot()).toMatchObject({ status: 'recovery-required' });
+  });
+
+  test.each([
+    'database WAL retirement',
+    'database SHM retirement',
+    'database retirement',
+    'media retirement',
+    'candidate database install',
+    'candidate media install',
+  ])('a process interruption after %s leaves a fresh manager blocked', async (boundary) => {
+    const store = new MemoryRecoverySentinelStore();
+    const first = new MigrationDatabase();
+    const manager = createDatabaseManager(
+      'baby-growth.db',
+      jest.fn(async () => asSQLiteDatabase(first)),
+      store,
+    ) as RecoveryJournalManager;
+
+    await expect(manager.withRecoveryJournal(
+      { operation: 'restore', operationId: 'restore-boundary' },
+      async () => {
+        expect(store.required).toBe(true);
+        throw new Error(`simulated termination after ${boundary}`);
+      },
+    )).rejects.toThrow(`simulated termination after ${boundary}`);
+
+    const restartedOpen = jest.fn(async () => asSQLiteDatabase(new MigrationDatabase()));
+    const restarted = createDatabaseManager('baby-growth.db', restartedOpen, store);
+    await expect(restarted.initialize()).rejects.toMatchObject({
+      name: 'DatabaseRecoveryRequiredError',
+    });
+    expect(restartedOpen).not.toHaveBeenCalled();
+    expect(store.clearRecoveryRequired).not.toHaveBeenCalled();
   });
 });

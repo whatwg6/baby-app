@@ -1,17 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { useLocalSearchParams, useRouter, type Href } from 'expo-router';
 
+import { useAppServices } from '../../../src/app/AppProvider';
 import type { RecordRepository } from '../../../src/data/repositories';
 import type { RecordDraft, TimelineRecord } from '../../../src/domain/types';
 import {
   CLEANUP_PENDING_MESSAGE,
-  mediaService,
   updateRecordWithMedia,
   type MediaService,
 } from '../../../src/features/media/mediaService';
 import { RecordEditor } from '../../../src/features/records/RecordEditor';
-import { useRecordRepository } from '../../../src/features/records/RecordRepositoryProvider';
 import { colors, spacing } from '../../../src/ui/theme';
 
 const loadErrorMessage = '无法读取记录，请重试';
@@ -24,14 +23,27 @@ type RecordLoadState = {
   error: string | null;
 };
 
-export default function EditRecordRoute({
-  media = mediaService,
-  showCleanupPending = (message) => Alert.alert(message),
+export default function EditRecordRoute() {
+  const { media, records, reportCleanupWarning } = useAppServices();
+
+  return (
+    <EditRecordScreen
+      media={media}
+      repository={records}
+      showCleanupPending={reportCleanupWarning}
+    />
+  );
+}
+
+export function EditRecordScreen({
+  media,
+  repository,
+  showCleanupPending,
 }: {
-  media?: MediaService;
-  showCleanupPending?(message: string): void;
-} = {}) {
-  const repository = useRecordRepository();
+  media: MediaService;
+  repository: RecordRepository;
+  showCleanupPending(message: string): void;
+}) {
   const router = useRouter();
   const { id } = useLocalSearchParams<{ id?: string | string[] }>();
   const recordId = typeof id === 'string' ? id : '';

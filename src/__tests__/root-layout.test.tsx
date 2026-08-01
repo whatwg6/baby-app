@@ -8,6 +8,7 @@ import {
 } from '../data/database';
 import type { SQLiteRepositories } from '../data/repositories';
 import type { AppMediaStorage } from '../app/initializeApp';
+import { createMaintenanceCoordinator } from '../app/maintenance';
 import { MemoryBabyRepository, MemoryRecordRepository } from '../test/memoryRepositories';
 
 jest.mock('expo-sqlite', () => ({
@@ -49,6 +50,16 @@ function asSQLiteDatabase(database: LayoutDatabase): SQLiteDatabase {
   return database as unknown as SQLiteDatabase;
 }
 
+function memoryRepositories(): SQLiteRepositories {
+  return {
+    babies: new MemoryBabyRepository(),
+    records: new MemoryRecordRepository(),
+    mediaReferences: {
+      listReferencedMediaPaths: jest.fn(async () => []),
+    },
+  };
+}
+
 test('removes stale providers while closed and installs fresh repositories before work continues', async () => {
   const first = new LayoutDatabase();
   const reopened = new LayoutDatabase();
@@ -60,10 +71,7 @@ test('removes stale providers while closed and installs fresh repositories befor
   const events: string[] = [];
   const repositoryFactory = jest.fn((handle: SQLiteDatabase): SQLiteRepositories => {
     events.push(handle === asSQLiteDatabase(first) ? 'repositories:first' : 'repositories:fresh');
-    return {
-      babies: new MemoryBabyRepository(),
-      records: new MemoryRecordRepository(),
-    };
+    return memoryRepositories();
   });
 
   await render(
@@ -116,12 +124,48 @@ test('removes stale providers while closed and installs fresh repositories befor
   expect(repositoryFactory).toHaveBeenCalledTimes(2);
 });
 
+test('globally hides business routes during clear and preserves its warning after remount', async () => {
+  const databaseHandle = new LayoutDatabase();
+  const database = createDatabaseManager(
+    'baby-growth.db',
+    jest.fn(async () => asSQLiteDatabase(databaseHandle)),
+  );
+  const maintenance = createMaintenanceCoordinator();
+
+  await render(
+    <DatabaseRoot
+      cleanupMedia={jest.fn(async () => undefined)}
+      database={database}
+      maintenance={maintenance}
+      mediaStorage={mediaStorage}
+      repositoryFactory={memoryRepositories}
+    />,
+  );
+  await screen.findByText('app-ready');
+
+  let lease!: ReturnType<typeof maintenance.begin>;
+  await act(async () => {
+    lease = maintenance.begin('clear');
+  });
+  expect(screen.queryByText('app-ready')).toBeNull();
+  expect(screen.getByText('正在维护本地数据…')).toBeTruthy();
+
+  await act(async () => {
+    lease.finish({ warning: '旧媒体被系统锁定' });
+  });
+  expect(await screen.findByText('app-ready')).toBeTruthy();
+  expect(screen.getByText('旧媒体被系统锁定')).toBeTruthy();
+});
+
 test('renders a blocking recovery state without reopening partial files', async () => {
   let recoveryRequired = false;
   const recoveryStore: RecoverySentinelStore = {
     isRecoveryRequired: jest.fn(() => recoveryRequired),
     markRecoveryRequired: jest.fn(() => {
       recoveryRequired = true;
+    }),
+    clearRecoveryRequired: jest.fn(() => {
+      recoveryRequired = false;
     }),
   };
   const first = new LayoutDatabase();
@@ -135,10 +179,7 @@ test('renders a blocking recovery state without reopening partial files', async 
       cleanupMedia={jest.fn(async () => undefined)}
       database={database}
       mediaStorage={mediaStorage}
-      repositoryFactory={() => ({
-        babies: new MemoryBabyRepository(),
-        records: new MemoryRecordRepository(),
-      })}
+      repositoryFactory={memoryRepositories}
     />,
   );
   await screen.findByText('app-ready');
@@ -168,10 +209,7 @@ test('renders a blocking recovery state without reopening partial files', async 
       cleanupMedia={jest.fn(async () => undefined)}
       database={restartedDatabase}
       mediaStorage={mediaStorage}
-      repositoryFactory={() => ({
-        babies: new MemoryBabyRepository(),
-        records: new MemoryRecordRepository(),
-      })}
+      repositoryFactory={memoryRepositories}
     />,
   );
 
@@ -200,10 +238,7 @@ test('keeps business routes unmounted when migration fails and retries initializ
       cleanupMedia={jest.fn(async () => undefined)}
       database={database}
       mediaStorage={mediaStorage}
-      repositoryFactory={() => ({
-        babies: new MemoryBabyRepository(),
-        records: new MemoryRecordRepository(),
-      })}
+      repositoryFactory={memoryRepositories}
     />,
   );
 

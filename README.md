@@ -52,6 +52,8 @@ npx expo export --platform android --output-dir dist/android
 - `database/app.db`：执行 WAL checkpoint 并关闭连接后取得的一致 SQLite 快照。
 - `media/`：数据库实际引用的头像、照片、视频与缩略图。
 
-恢复前会校验归档路径、大小、版本、哈希和 SQLite 完整性。损坏或不兼容的备份不会覆盖现有数据；替换失败会尝试从 rollback 副本恢复。
+恢复前会校验归档路径、大小、版本、哈希和 SQLite 完整性。恢复候选数据库、每个媒体文件及候选媒体目录会先通过原生 stable-storage barrier 落盘，再开始重命名；损坏、不兼容或无法确认落盘的备份不会覆盖现有数据。清空数据时会整体替换 `media/` 目录，而不是逐个删除媒体文件。替换失败会尝试从 rollback 副本恢复。
 
-如果 rollback 也无法安全完成，App 会先在 Documents 中写入独立于 SQLite、WAL 和 SHM 文件集的 recovery sentinel，再进入“本地数据恢复不完整，数据库已保持关闭”的阻塞状态，移除全部 repository 服务且不提供重试按钮。每次启动和重开数据库前都会检查该 sentinel，因此反复启动不能绕过阻塞。此时应保留 App 私有数据并进行受控恢复；只有人工或支持人员确认 SQLite、WAL 和 SHM 已形成一致文件集后，才可以移除 sentinel，不能先删 sentinel 再尝试打开数据库。
+恢复与清空会在任何替换前写入两个同步 SQLite recovery journal：先写主数据库目录旁的 journal，再写 Documents 目录中的 journal。完成后按相反方向清除，Documents journal 先清，主数据库旁的 journal 最后清；任一 journal 存在、不可读或清除结果不确定，App 都会进入“本地数据恢复不完整，数据库已保持关闭”的阻塞状态，移除全部 repository 服务且不提供重试按钮。每次启动和重开数据库前都会检查两侧 journal；旧版 JSON sentinel 也仍会触发阻塞，因此反复启动不能绕过恢复状态。
+
+此时应保留 App 私有数据并进行受控恢复。只有人工或支持人员确认数据库、WAL、SHM、媒体目录及 rollback 文件已经形成一致集合后，才能通过受控工具先解除 Documents 侧 barrier、最后解除主数据库侧 barrier；不能先删除主 barrier 再尝试打开数据库。

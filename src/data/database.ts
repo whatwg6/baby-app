@@ -5,6 +5,10 @@ import { migrateDatabase } from './migrations';
 export interface DatabaseManager {
   initialize(): Promise<SQLiteDatabase>;
   withClosedDatabase<T>(work: (databasePath: string) => Promise<T>): Promise<T>;
+  withRecoveryJournal<T>(
+    journal: RecoveryJournal,
+    work: (context: RecoveryJournalContext) => Promise<T>,
+  ): Promise<T>;
   reopen(): Promise<SQLiteDatabase>;
   markRecoveryRequired(cause: unknown): DatabaseRecoveryRequiredError;
   getLifecycleSnapshot(): DatabaseLifecycleSnapshot;
@@ -13,8 +17,20 @@ export interface DatabaseManager {
 
 export interface RecoverySentinelStore {
   isRecoveryRequired(): boolean;
-  markRecoveryRequired(): void;
+  markRecoveryRequired(journal?: RecoveryJournal): void;
+  clearRecoveryRequired(): void;
 }
+
+export type RecoveryJournal = {
+  operation: 'restore' | 'clear' | 'manual';
+  operationId: string;
+};
+
+export type RecoveryJournalContext = {
+  databasePath: string;
+  reopen(): Promise<SQLiteDatabase>;
+  closeReopened(): Promise<void>;
+};
 
 export type DatabaseLifecycleSnapshot =
   | { status: 'closed' }
@@ -42,6 +58,7 @@ class ExpoDatabaseManager implements DatabaseManager {
   private lifecycleSnapshot: DatabaseLifecycleSnapshot = { status: 'closed' };
   private readonly listeners = new Set<() => void>();
   private recoveryRequired: DatabaseRecoveryRequiredError | null = null;
+  private recoveryJournalActive = false;
 
   constructor(
     private readonly databaseName: string,
@@ -67,7 +84,12 @@ class ExpoDatabaseManager implements DatabaseManager {
     this.recoveryRequired = error;
     this.database = null;
     try {
-      this.recoverySentinel.markRecoveryRequired();
+      if (!this.recoveryJournalActive) {
+        this.recoverySentinel.markRecoveryRequired({
+          operation: 'manual',
+          operationId: `manual-${Date.now()}`,
+        });
+      }
     } catch (sentinelError) {
       error = new DatabaseRecoveryRequiredError(
         'Local data recovery is required, but its persistent sentinel could not be written.',
@@ -158,6 +180,101 @@ class ExpoDatabaseManager implements DatabaseManager {
     });
   }
 
+  async withRecoveryJournal<T>(
+    journal: RecoveryJournal,
+    work: (context: RecoveryJournalContext) => Promise<T>,
+  ): Promise<T> {
+    return this.withLifecycle(async () => {
+      const current = await this.initializeOpen();
+      await this.closeBeforeRecovery(current);
+
+      try {
+        this.recoverySentinel.markRecoveryRequired(journal);
+        this.recoveryJournalActive = true;
+      } catch (cause) {
+        this.latchRecoveryRequired(new DatabaseRecoveryRequiredError(
+          'The recovery journal could not be persisted; replacement work was aborted.',
+          cause,
+        ));
+        throw cause;
+      }
+
+      let value: T | undefined;
+      let completed = false;
+      let primaryError: unknown;
+      const reopen = async (): Promise<SQLiteDatabase> => {
+        if (this.database !== null) {
+          return this.database;
+        }
+        const reopened = await this.openAndMigrate();
+        this.database = reopened;
+        return reopened;
+      };
+      const closeReopened = async (): Promise<void> => {
+        const reopened = this.database;
+        if (reopened === null) {
+          return;
+        }
+        try {
+          await reopened.closeAsync();
+        } finally {
+          this.invalidateDatabase(reopened);
+          this.publish({ status: 'closed' });
+        }
+      };
+
+      try {
+        value = await work({ closeReopened, databasePath: current.databasePath, reopen });
+        completed = true;
+      } catch (cause) {
+        primaryError = cause;
+      }
+
+      if (this.database === null || this.recoveryRequired !== null) {
+        if (this.recoveryRequired === null) {
+          this.latchRecoveryRequired(new DatabaseRecoveryRequiredError(
+            'Recovery work ended without a verified safe database reopen.',
+            primaryError ?? new Error('Recovery work did not reopen the database.'),
+          ));
+        }
+        if (primaryError !== undefined) {
+          throw primaryError;
+        }
+        throw this.recoveryRequired;
+      }
+
+      const verifiedDatabase = this.database;
+      try {
+        this.recoverySentinel.clearRecoveryRequired();
+      } catch (clearError) {
+        let cause: unknown = clearError;
+        try {
+          await verifiedDatabase.closeAsync();
+        } catch (closeError) {
+          cause = new AggregateError(
+            [clearError, closeError],
+            'Recovery journal clearing and safe-handle closing both failed.',
+          );
+        }
+        this.invalidateDatabase(verifiedDatabase);
+        throw this.latchRecoveryRequired(new DatabaseRecoveryRequiredError(
+          'Recovery completed, but its durable journal could not be cleared safely.',
+          cause,
+        ));
+      }
+
+      this.recoveryJournalActive = false;
+      this.publish({ status: 'open', database: verifiedDatabase });
+      if (primaryError !== undefined) {
+        throw primaryError;
+      }
+      if (!completed) {
+        throw new Error('Recovery work did not complete.');
+      }
+      return value as T;
+    });
+  }
+
   private async initializeOpen(): Promise<SQLiteDatabase> {
     if (this.recoveryRequired !== null) {
       throw this.recoveryRequired;
@@ -200,6 +317,41 @@ class ExpoDatabaseManager implements DatabaseManager {
         this.opening = null;
       }
     }
+  }
+
+  private async closeBeforeRecovery(database: SQLiteDatabase): Promise<void> {
+    let primaryError: unknown;
+    const cleanupErrors: unknown[] = [];
+    this.publish({ status: 'closing', database });
+    try {
+      await database.execAsync('PRAGMA wal_checkpoint(TRUNCATE);');
+      await database.closeAsync();
+    } catch (cause) {
+      primaryError = cause;
+      try {
+        await database.closeAsync();
+      } catch (closeError) {
+        cleanupErrors.push(closeError);
+      }
+    }
+    this.invalidateDatabase(database);
+    this.publish({ status: 'closed' });
+
+    if (primaryError === undefined) {
+      return;
+    }
+    try {
+      await this.initializeOpen();
+    } catch (reopenError) {
+      cleanupErrors.push(reopenError);
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [primaryError, ...cleanupErrors],
+        'Database could not be prepared for recovery work and lifecycle cleanup failed.',
+      );
+    }
+    throw primaryError;
   }
 
   private async withLifecycle<T>(work: () => Promise<T>): Promise<T> {
@@ -272,6 +424,9 @@ function createMemoryRecoverySentinelStore(): RecoverySentinelStore {
     isRecoveryRequired: () => required,
     markRecoveryRequired: () => {
       required = true;
+    },
+    clearRecoveryRequired: () => {
+      required = false;
     },
   };
 }

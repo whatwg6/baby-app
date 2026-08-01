@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useVideoPlayer, VideoView } from 'expo-video';
 import { Image, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import type { MediaType } from '../../domain/types';
@@ -28,9 +29,7 @@ export function MediaPreview({
           <Text style={styles.placeholderText}>媒体文件不可用</Text>
         </View>
       ) : mediaType === 'video' ? (
-        <View accessibilityLabel="视频媒体" style={styles.placeholder}>
-          <Text style={styles.placeholderText}>视频媒体</Text>
-        </View>
+        <VideoPreview uri={uri} />
       ) : (
         <Image
           accessibilityLabel={accessibilityLabel}
@@ -48,8 +47,31 @@ export function MediaPreview({
   );
 }
 
+function VideoPreview({ uri }: { uri: string }) {
+  const player = useVideoPlayer(uri);
+
+  return (
+    <View style={styles.videoContainer}>
+      <VideoView
+        accessibilityLabel="视频媒体"
+        nativeControls
+        player={player}
+        style={styles.image}
+      />
+      <Pressable
+        accessibilityLabel="播放视频"
+        accessibilityRole="button"
+        onPress={() => player.play()}
+      >
+        <Text style={styles.play}>播放视频</Text>
+      </Pressable>
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
   container: { alignItems: 'center', gap: spacing.xs },
+  videoContainer: { alignItems: 'center', gap: spacing.xs },
   image: { borderRadius: radius.sm, height: 104, width: 104 },
   placeholder: {
     alignItems: 'center',
@@ -61,5 +83,6 @@ const styles = StyleSheet.create({
     width: 104,
   },
   placeholderText: { color: colors.muted, fontSize: 13, textAlign: 'center' },
+  play: { color: colors.accent, fontSize: 13, fontWeight: '700' },
   remove: { color: colors.danger, fontSize: 13 },
 });

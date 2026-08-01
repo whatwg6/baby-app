@@ -47,6 +47,7 @@ export function ActivityFields({
     <View style={styles.container}>
       <View>
         <Text style={styles.label}>活动类型</Text>
+        <Text style={styles.help}>选择类型即可保存；数量、时长和备注均可不填。</Text>
         <View style={styles.options}>
           {activityOptions.map(([activityType, label]) => (
             <Pressable
@@ -145,6 +146,7 @@ function toDetails(value: FormValue): EditableActivityDetails {
 const styles = StyleSheet.create({
   container: { gap: spacing.md },
   label: { color: colors.text, fontSize: 15, fontWeight: '600', marginBottom: spacing.sm },
+  help: { color: colors.muted, fontSize: 13, marginBottom: spacing.sm },
   options: { flexDirection: 'row', gap: spacing.sm },
   option: {
     borderColor: colors.border,

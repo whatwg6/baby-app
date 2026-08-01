@@ -65,14 +65,6 @@ const recordDraftSchema = z.discriminatedUnion('type', [
       amount: nullableFiniteNumberSchema.pipe(z.number().min(0).nullable()),
       durationMinutes: nullableFiniteNumberSchema.pipe(z.number().positive().nullable()),
     }),
-  }).superRefine((record, context) => {
-    if (
-      record.note === null &&
-      record.details.amount === null &&
-      record.details.durationMinutes === null
-    ) {
-      context.addIssue({ code: 'custom', message: 'An activity needs an amount, duration, or note.' });
-    }
   }),
   z.object({
     type: z.literal('milestone'),

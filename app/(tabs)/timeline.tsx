@@ -42,6 +42,7 @@ export default function TimelineScreen() {
     <TimelineFeatureScreen
       repository={repository}
       baby={baby}
+      onAddPress={() => router.push('/(tabs)/add' as Href)}
       onRecordPress={(record) => router.push(`/record/${record.id}` as Href)}
     />
   );

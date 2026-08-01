@@ -6,7 +6,14 @@ import type {
   RecordType,
   TimelineRecord,
 } from '../domain/types';
-import type { BabyRepository, RecordRepository, RecordTransaction } from '../data/repositories';
+import type {
+  BabyRepository,
+  RecordListOptions,
+  RecordPage,
+  RecordPageCursor,
+  RecordRepository,
+  RecordTransaction,
+} from '../data/repositories';
 
 export class MemoryBabyRepository implements BabyRepository {
   private baby: Baby | null = null;
@@ -118,10 +125,30 @@ export class MemoryRecordRepository implements RecordRepository {
 
   async list(filter?: { types?: RecordType[] }): Promise<TimelineRecord[]> {
     const types = filter?.types;
+    return this.sortedRecords(types)
+      .map(copy);
+  }
+
+  async listPage(options: RecordListOptions = {}): Promise<RecordPage> {
+    const limit = normalizePageLimit(options.limit);
+    const cursor = options.cursor ?? null;
+    const candidates = this.sortedRecords(options.types)
+      .filter((record) => cursor === null || isAfterCursor(record, cursor));
+    const records = candidates.slice(0, limit);
+    const lastRecord = records.at(-1);
+
+    return {
+      records: records.map(copy),
+      nextCursor: candidates.length > limit && lastRecord !== undefined
+        ? toCursor(lastRecord)
+        : null,
+    };
+  }
+
+  private sortedRecords(types?: RecordType[]): TimelineRecord[] {
     return [...this.records.values()]
       .filter((record) => types === undefined || types.length === 0 || types.includes(record.type))
-      .sort((left, right) => right.occurredAt.localeCompare(left.occurredAt))
-      .map(copy);
+      .sort(compareRecordsDescending);
   }
 
   async get(id: string): Promise<TimelineRecord | null> {
@@ -139,6 +166,37 @@ export class MemoryRecordRepository implements RecordRepository {
     this.records = stagedRecords;
     return value;
   }
+}
+
+function normalizePageLimit(limit: number | undefined): number {
+  if (limit === undefined || !Number.isFinite(limit)) {
+    return 20;
+  }
+  return Math.max(1, Math.min(100, Math.trunc(limit)));
+}
+
+function compareRecordsDescending(left: TimelineRecord, right: TimelineRecord): number {
+  return right.occurredAt.localeCompare(left.occurredAt)
+    || right.createdAt.localeCompare(left.createdAt)
+    || right.id.localeCompare(left.id);
+}
+
+function isAfterCursor(record: TimelineRecord, cursor: RecordPageCursor): boolean {
+  return record.occurredAt < cursor.occurredAt
+    || (record.occurredAt === cursor.occurredAt && record.createdAt < cursor.createdAt)
+    || (
+      record.occurredAt === cursor.occurredAt
+      && record.createdAt === cursor.createdAt
+      && record.id < cursor.id
+    );
+}
+
+function toCursor(record: TimelineRecord): RecordPageCursor {
+  return {
+    occurredAt: record.occurredAt,
+    createdAt: record.createdAt,
+    id: record.id,
+  };
 }
 
 let nextId = 0;

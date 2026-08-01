@@ -1,8 +1,8 @@
-import { useState } from 'react';
-import { Image, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import type { ActivityDetails, GrowthDetails, MilestoneDetails, TimelineRecord } from '../../domain/types';
 import { colors, radius, spacing } from '../../ui/theme';
+import { MediaPreview } from '../media/MediaPreview';
 
 const activityLabels: Record<ActivityDetails['activityType'], string> = {
   feeding: '喂养',
@@ -44,25 +44,18 @@ export function TimelineCard({
   record: TimelineRecord;
   onPress?(): void;
 }) {
-  const firstImage = record.attachments.find((attachment) => attachment.mediaType === 'image');
-  const imageUri = firstImage?.thumbnailPath || firstImage?.filePath || '';
-  const [imageUnavailable, setImageUnavailable] = useState(false);
+  const firstAttachment = record.attachments[0];
 
   const content = (
     <>
-      {record.type === 'moment' ? (
-        imageUri.trim().length > 0 && !imageUnavailable ? (
-          <Image
-            accessibilityLabel="珍贵时刻照片"
-            onError={() => setImageUnavailable(true)}
-            source={{ uri: imageUri }}
-            style={styles.photo}
-          />
-        ) : (
-          <View accessibilityLabel="媒体文件不可用" style={styles.mediaPlaceholder}>
-            <Text style={styles.mediaPlaceholderText}>媒体文件不可用</Text>
-          </View>
-        )
+      {record.type === 'moment' && firstAttachment !== undefined ? (
+        <MediaPreview
+          accessibilityLabel="珍贵时刻照片"
+          mediaType={firstAttachment.mediaType}
+          uri={firstAttachment.mediaType === 'video'
+            ? firstAttachment.filePath
+            : firstAttachment.thumbnailPath ?? firstAttachment.filePath}
+        />
       ) : null}
       <View style={styles.content}>
         <Text style={styles.type}>{recordTypeLabel(record.type)}</Text>
@@ -115,17 +108,6 @@ const styles = StyleSheet.create({
     gap: spacing.md,
     padding: spacing.md,
   },
-  photo: { borderRadius: radius.sm, height: 72, width: 72 },
-  mediaPlaceholder: {
-    alignItems: 'center',
-    backgroundColor: colors.background,
-    borderRadius: radius.sm,
-    height: 72,
-    justifyContent: 'center',
-    padding: spacing.xs,
-    width: 72,
-  },
-  mediaPlaceholderText: { color: colors.muted, fontSize: 12, textAlign: 'center' },
   content: { flex: 1, gap: spacing.xs },
   type: { color: colors.muted, fontSize: 13, fontWeight: '600' },
   summary: { color: colors.text, fontSize: 16, fontWeight: '700' },

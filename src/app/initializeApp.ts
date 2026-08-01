@@ -18,6 +18,11 @@ import {
   type MediaService,
 } from '../features/media/mediaService';
 import type { AppServices } from './AppProvider';
+import {
+  createMaintenanceAwareMediaService,
+  createMaintenanceCoordinator,
+  type MaintenanceCoordinator,
+} from './maintenance';
 
 export interface AppMediaStorage {
   ensureDirectories(): Promise<void>;
@@ -29,6 +34,7 @@ type BackupFactory = (dependencies: {
   babies: BabyRepository;
   records: RecordRepository;
   media: MediaService;
+  maintenance?: MaintenanceCoordinator;
 }) => BackupService;
 
 export type InitializeAppDependencies = {
@@ -38,6 +44,7 @@ export type InitializeAppDependencies = {
   repositoryFactory?(database: SQLiteDatabase): SQLiteRepositories;
   backupFactory?: BackupFactory;
   cleanupMedia?: typeof removeUnreferencedMedia;
+  maintenance?: MaintenanceCoordinator;
 };
 
 export async function initializeApp(
@@ -48,14 +55,14 @@ export async function initializeApp(
   const mediaStorage = dependencies.mediaStorage ?? createAppMediaStorage();
   const repositoryFactory = dependencies.repositoryFactory ?? createSQLiteRepositories;
   const cleanupMedia = dependencies.cleanupMedia ?? removeUnreferencedMedia;
+  const maintenance = dependencies.maintenance ?? createMaintenanceCoordinator();
 
   await mediaStorage.ensureDirectories();
   const databaseHandle = await database.initialize();
   const repositories = repositoryFactory(databaseHandle);
   await mediaStorage.clearStaging();
   await cleanupMedia({
-    babies: repositories.babies,
-    records: repositories.records,
+    mediaReferences: repositories.mediaReferences,
     media,
   });
 
@@ -64,6 +71,7 @@ export async function initializeApp(
     media,
     repositories,
     backupFactory: dependencies.backupFactory,
+    maintenance,
   });
 }
 
@@ -72,24 +80,29 @@ export function assembleAppServices({
   media,
   repositories,
   backupFactory = createBackupService,
+  maintenance = createMaintenanceCoordinator(),
 }: {
   database: DatabaseManager;
   media: MediaService;
   repositories: SQLiteRepositories;
   backupFactory?: BackupFactory;
+  maintenance?: MaintenanceCoordinator;
 }): AppServices {
   const backup = backupFactory({
     database,
     babies: repositories.babies,
     records: repositories.records,
     media,
+    maintenance,
   });
+  const guardedMedia = createMaintenanceAwareMediaService(media, maintenance);
   return {
     babies: repositories.babies,
     records: repositories.records,
-    media,
+    media: guardedMedia,
     backup,
     database,
+    reportCleanupWarning: maintenance.publishWarning,
   };
 }
 

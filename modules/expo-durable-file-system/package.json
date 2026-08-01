@@ -1,0 +1,8 @@
+{
+  "name": "expo-durable-file-system",
+  "version": "1.0.0",
+  "description": "Private Expo module providing stable-storage barriers for restore payloads",
+  "license": "MIT",
+  "author": "Baby Growth Timeline",
+  "homepage": "https://example.invalid/baby-growth-timeline"
+}

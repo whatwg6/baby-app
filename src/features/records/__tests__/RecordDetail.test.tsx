@@ -6,6 +6,14 @@ import type { MediaService } from '../../media/mediaService';
 import RecordDetail from '../RecordDetail';
 import { MemoryRecordRepository } from '../../../test/memoryRepositories';
 
+jest.mock('expo-video', () => {
+  const { View } = require('react-native') as typeof import('react-native');
+  return {
+    useVideoPlayer: () => ({ play: jest.fn() }),
+    VideoView: (props: Record<string, unknown>) => <View {...props} />,
+  };
+});
+
 test('shows growth measurements in cm and kg and a missing-media placeholder', async () => {
   const repository = new MemoryRecordRepository();
   const record = await repository.create({
@@ -43,6 +51,28 @@ test('shows a not-found state when the requested record does not exist', async (
   await waitFor(() => expect(screen.getByText('记录不存在')).toBeTruthy());
 });
 
+test('uses the original private video path for playable detail media', async () => {
+  const repository = new MemoryRecordRepository();
+  const record = await repository.create({
+    type: 'moment',
+    occurredAt: '2026-08-02T09:30:00.000Z',
+    note: null,
+    details: null,
+    attachments: [{
+      id: 'video-detail',
+      mediaType: 'video',
+      filePath: 'file:///documents/media/detail.mp4',
+      thumbnailPath: 'file:///documents/media/detail-thumb.jpg',
+    }],
+  });
+
+  await render(<RecordDetail repository={repository} recordId={record.id} />);
+
+  const playback = await screen.findByRole('button', { name: '播放视频' });
+  expect(playback).toBeTruthy();
+  expect(screen.queryByText('媒体文件不可用')).toBeNull();
+});
+
 test('retries a failed record lookup', async () => {
   const storedRepository = new MemoryRecordRepository();
   const record = await storedRepository.create({
@@ -58,6 +88,7 @@ test('retries a failed record lookup', async () => {
     update: (id, input) => storedRepository.update(id, input),
     delete: (id) => storedRepository.delete(id),
     list: (filter) => storedRepository.list(filter),
+    listPage: (options) => storedRepository.listPage(options),
     withTransaction: (work) => storedRepository.withTransaction(work),
     get: (id) => (shouldFail ? Promise.reject(new Error('database is unavailable')) : storedRepository.get(id)),
   };
@@ -110,4 +141,27 @@ test('routes the detail delete action through irreversible confirmation', async 
     expect.any(Array),
   );
   expect(onDelete).not.toHaveBeenCalled();
+});
+
+test('keeps attachment-heavy detail actions reachable in a keyboard-aware scroll container', async () => {
+  const repository = new MemoryRecordRepository();
+  const record = await repository.create({
+    type: 'moment',
+    occurredAt: '2026-08-02T09:30:00.000Z',
+    note: '很多照片的一天',
+    details: null,
+    attachments: Array.from({ length: 12 }, (_, index) => ({
+      id: `detail-photo-${index}`,
+      mediaType: 'image' as const,
+      filePath: `file:///documents/media/detail-${index}.jpg`,
+      thumbnailPath: null,
+    })),
+  });
+
+  const view = await render(<RecordDetail repository={repository} recordId={record.id} />);
+  await view.findByRole('button', { name: '编辑' });
+
+  expect(view.queryByTestId('record-detail-keyboard-avoiding')).toBeTruthy();
+  expect(view.getByTestId('record-detail-scroll').props.keyboardShouldPersistTaps).toBe('handled');
+  expect(view.getByRole('button', { name: '删除' })).toBeTruthy();
 });

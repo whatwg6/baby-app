@@ -14,6 +14,7 @@ export interface AppServices {
   media: MediaService;
   backup: BackupService;
   database: DatabaseManager;
+  reportCleanupWarning(message: string): void;
 }
 
 const AppServicesContext = createContext<AppServices | null>(null);

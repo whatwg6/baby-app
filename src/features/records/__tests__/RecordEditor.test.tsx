@@ -10,6 +10,14 @@ jest.mock('expo-image-picker', () => ({
   launchImageLibraryAsync: jest.fn(),
 }));
 
+jest.mock('expo-video', () => {
+  const { View } = require('react-native') as typeof import('react-native');
+  return {
+    useVideoPlayer: () => ({ play: jest.fn() }),
+    VideoView: (props: Record<string, unknown>) => <View {...props} />,
+  };
+});
+
 const requestPermission = ImagePicker.requestMediaLibraryPermissionsAsync as jest.MockedFunction<
   typeof ImagePicker.requestMediaLibraryPermissionsAsync
 >;
@@ -67,6 +75,22 @@ describe('RecordEditor', () => {
 
     expect(await view.findByText('请选择活动类型')).toBeTruthy();
     expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  test('saves an activity type with optional amount, duration, and note left empty', async () => {
+    const onSubmit = jest.fn();
+    const view = await render(<RecordEditor now={now} onSubmit={onSubmit} type="activity" />);
+
+    await fireEvent.press(view.getByRole('button', { name: '睡眠' }));
+    await fireEvent.press(view.getByRole('button', { name: '保存' }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith({
+      type: 'activity',
+      occurredAt: '2026-08-01T09:30:00.000Z',
+      note: null,
+      details: { activityType: 'sleep', amount: null, durationMinutes: null },
+      attachments: [],
+    }));
   });
 
   test('requires a milestone title', async () => {
@@ -244,5 +268,29 @@ describe('RecordEditor', () => {
     await waitFor(() => expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
       attachments: [],
     })));
+  });
+
+  test('keeps an attachment-heavy editor reachable in a keyboard-aware scroll container', async () => {
+    const initialValue: RecordDraft = {
+      type: 'moment',
+      occurredAt: '2026-07-31T18:20:00.000Z',
+      note: '一次很长的成长记录',
+      details: null,
+      attachments: Array.from({ length: 12 }, (_, index) => ({
+        kind: 'existing' as const,
+        id: `attachment-${index}`,
+        mediaType: 'image' as const,
+        filePath: `file:///media/photo-${index}.jpg`,
+        thumbnailPath: null,
+      })),
+    };
+
+    const view = await render(
+      <RecordEditor initialValue={initialValue} now={now} onSubmit={jest.fn()} type="moment" />,
+    );
+
+    expect(view.queryByTestId('record-editor-keyboard-avoiding')).toBeTruthy();
+    expect(view.getByTestId('record-editor-scroll').props.keyboardShouldPersistTaps).toBe('handled');
+    expect(view.getByRole('button', { name: '保存' })).toBeTruthy();
   });
 });

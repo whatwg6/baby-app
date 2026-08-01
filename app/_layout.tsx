@@ -5,6 +5,11 @@ import { Stack } from 'expo-router';
 import { AppErrorBoundary } from '../src/app/AppErrorBoundary';
 import { AppProvider, type AppServices } from '../src/app/AppProvider';
 import {
+  createMaintenanceCoordinator,
+  type MaintenanceCoordinator,
+  type MaintenanceSnapshot,
+} from '../src/app/maintenance';
+import {
   assembleAppServices,
   initializeApp,
   type AppMediaStorage,
@@ -24,13 +29,15 @@ type BootstrapState =
 export default function RootLayout() {
   const recoverySentinelRef = useRef<ReturnType<typeof createExpoRecoverySentinelStore> | null>(null);
   const databaseRef = useRef<DatabaseManager | null>(null);
+  const maintenanceRef = useRef<MaintenanceCoordinator | null>(null);
   recoverySentinelRef.current ??= createExpoRecoverySentinelStore();
   databaseRef.current ??= createDatabaseManager(
     'baby-growth-timeline.db',
     undefined,
     recoverySentinelRef.current,
   );
-  return <DatabaseRoot database={databaseRef.current} />;
+  maintenanceRef.current ??= createMaintenanceCoordinator();
+  return <DatabaseRoot database={databaseRef.current} maintenance={maintenanceRef.current} />;
 }
 
 export function DatabaseRoot({
@@ -39,17 +46,29 @@ export function DatabaseRoot({
   cleanupMedia = removeUnreferencedMedia,
   media = mediaService,
   mediaStorage,
+  maintenance: suppliedMaintenance,
 }: {
   database: DatabaseManager;
   repositoryFactory?(database: Parameters<typeof createSQLiteRepositories>[0]): SQLiteRepositories;
   cleanupMedia?: typeof removeUnreferencedMedia;
   media?: MediaService;
   mediaStorage?: AppMediaStorage;
+  maintenance?: MaintenanceCoordinator;
 }) {
   const initialized = useRef(false);
   const [attempt, setAttempt] = useState(0);
   const [boundaryAttempt, setBoundaryAttempt] = useState(0);
   const [state, setState] = useState<BootstrapState>({ status: 'loading' });
+  const maintenanceRef = useRef<MaintenanceCoordinator | null>(null);
+  maintenanceRef.current ??= suppliedMaintenance ?? createMaintenanceCoordinator();
+  const maintenance = maintenanceRef.current;
+  const [maintenanceSnapshot, setMaintenanceSnapshot] = useState<MaintenanceSnapshot>(
+    maintenance.getSnapshot,
+  );
+
+  useEffect(() => maintenance.subscribe(() => {
+    setMaintenanceSnapshot(maintenance.getSnapshot());
+  }), [maintenance]);
 
   useEffect(() => {
     let active = true;
@@ -77,7 +96,7 @@ export function DatabaseRoot({
 
       try {
         const repositories = repositoryFactory(lifecycle.database);
-        const services = assembleAppServices({ database, media, repositories });
+        const services = assembleAppServices({ database, maintenance, media, repositories });
         setState({ status: 'ready', services });
       } catch {
         setState({ status: 'error' });
@@ -92,6 +111,7 @@ export function DatabaseRoot({
       mediaStorage,
       repositoryFactory,
       cleanupMedia,
+      maintenance,
     })
       .then((services) => {
         if (!active) {
@@ -114,7 +134,11 @@ export function DatabaseRoot({
       active = false;
       unsubscribe();
     };
-  }, [attempt, cleanupMedia, database, media, mediaStorage, repositoryFactory]);
+  }, [attempt, cleanupMedia, database, maintenance, media, mediaStorage, repositoryFactory]);
+
+  if (maintenanceSnapshot.active) {
+    return <LocalDataState status="maintenance" />;
+  }
 
   if (state.status !== 'ready') {
     return (
@@ -131,14 +155,24 @@ export function DatabaseRoot({
   }
 
   return (
-    <AppErrorBoundary
-      key={boundaryAttempt}
-      onRetry={() => setBoundaryAttempt((value) => value + 1)}
-    >
-      <AppProvider services={state.services}>
-        <Stack screenOptions={{ headerShown: false }} />
-      </AppProvider>
-    </AppErrorBoundary>
+    <View style={styles.app}>
+      {maintenanceSnapshot.warning === null ? null : (
+        <View accessibilityRole="alert" style={styles.warning}>
+          <Text style={styles.warningText}>{maintenanceSnapshot.warning}</Text>
+          <Pressable accessibilityRole="button" onPress={maintenance.clearWarning}>
+            <Text style={styles.warningDismiss}>关闭</Text>
+          </Pressable>
+        </View>
+      )}
+      <AppErrorBoundary
+        key={boundaryAttempt}
+        onRetry={() => setBoundaryAttempt((value) => value + 1)}
+      >
+        <AppProvider services={state.services}>
+          <Stack screenOptions={{ headerShown: false }} />
+        </AppProvider>
+      </AppErrorBoundary>
+    </View>
   );
 }
 
@@ -146,11 +180,12 @@ function LocalDataState({
   status,
   onRetry,
 }: {
-  status: Exclude<BootstrapState['status'], 'ready'>;
+  status: Exclude<BootstrapState['status'], 'ready'> | 'maintenance';
   onRetry?: () => void;
 }) {
   const message = status === 'recovery-required'
     ? '本地数据恢复不完整，数据库已保持关闭'
+    : status === 'maintenance' ? '正在维护本地数据…'
     : status === 'error' ? '无法打开本地数据' : '正在准备宝宝成长记录…';
   return (
     <View style={styles.startup}>
@@ -165,6 +200,17 @@ function LocalDataState({
 }
 
 const styles = StyleSheet.create({
+  app: { flex: 1 },
+  warning: {
+    alignItems: 'center',
+    backgroundColor: colors.card,
+    flexDirection: 'row',
+    gap: spacing.sm,
+    justifyContent: 'space-between',
+    padding: spacing.md,
+  },
+  warningText: { color: colors.danger, flex: 1, fontSize: 14 },
+  warningDismiss: { color: colors.accent, fontSize: 14, fontWeight: '700' },
   startup: {
     alignItems: 'center',
     backgroundColor: colors.background,

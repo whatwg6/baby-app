@@ -1,5 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
-import { Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import {
+  KeyboardAvoidingView,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
 
 import type {
   ActivityDetails,
@@ -107,65 +116,77 @@ export function RecordEditor({
   };
 
   return (
-    <View style={styles.form}>
-      <View>
-        <Text style={styles.label}>发生时间</Text>
-        <TextInput
-          accessibilityLabel="发生时间"
-          autoCapitalize="none"
-          onChangeText={(occurredAt) => setValue((current) => ({ ...current, occurredAt }))}
-          placeholder="YYYY-MM-DDTHH:mm:ss.sssZ"
-          style={styles.input}
-          value={value.occurredAt}
-        />
-        {errors.occurredAt === undefined ? null : <Text style={styles.error}>{errors.occurredAt}</Text>}
-      </View>
-
-      <RecordSpecificFields
-        attachments={value.attachments}
-        initialValue={detailsFor(type, initialValue?.details)}
-        onAdd={(attachment) => {
-          setValue((current) => ({
-            ...current,
-            attachments: [...current.attachments, attachment],
-          }));
-        }}
-        onChange={(details) => {
-          setValue((current) => ({ ...current, details }));
-        }}
-        onRemove={(index) => {
-          setValue((current) => ({
-            ...current,
-            attachments: current.attachments.filter((_, attachmentIndex) => attachmentIndex !== index),
-          }));
-        }}
-        resetKey={`${type}:${initialKey}`}
-        type={type}
-      />
-      {errors.details === undefined ? null : <Text style={styles.error}>{errors.details}</Text>}
-
-      <View>
-        <Text style={styles.label}>备注（可选）</Text>
-        <TextInput
-          accessibilityLabel="备注（可选）"
-          multiline
-          onChangeText={(note) => setValue((current) => ({ ...current, note }))}
-          placeholder="记录一些细节"
-          style={[styles.input, styles.noteInput]}
-          value={value.note}
-        />
-      </View>
-
-      {errors.save === undefined ? null : <Text style={styles.error}>{errors.save}</Text>}
-      <Pressable
-        accessibilityRole="button"
-        disabled={saving}
-        onPress={() => void handleSave()}
-        style={[styles.saveButton, saving && styles.saveButtonDisabled]}
+    <KeyboardAvoidingView
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      style={styles.keyboardAvoiding}
+      testID="record-editor-keyboard-avoiding"
+    >
+      <ScrollView
+        contentContainerStyle={styles.form}
+        keyboardShouldPersistTaps="handled"
+        testID="record-editor-scroll"
       >
-        <Text style={styles.saveButtonText}>{saving ? '保存中…' : '保存'}</Text>
-      </Pressable>
-    </View>
+        <View>
+          <Text style={styles.label}>发生时间</Text>
+          <TextInput
+            accessibilityLabel="发生时间"
+            autoCapitalize="none"
+            onChangeText={(occurredAt) => setValue((current) => ({ ...current, occurredAt }))}
+            placeholder="YYYY-MM-DDTHH:mm:ss.sssZ"
+            style={styles.input}
+            value={value.occurredAt}
+          />
+          {errors.occurredAt === undefined ? null : (
+            <Text style={styles.error}>{errors.occurredAt}</Text>
+          )}
+        </View>
+
+        <RecordSpecificFields
+          attachments={value.attachments}
+          initialValue={detailsFor(type, initialValue?.details)}
+          onAdd={(attachment) => {
+            setValue((current) => ({
+              ...current,
+              attachments: [...current.attachments, attachment],
+            }));
+          }}
+          onChange={(details) => {
+            setValue((current) => ({ ...current, details }));
+          }}
+          onRemove={(index) => {
+            setValue((current) => ({
+              ...current,
+              attachments: current.attachments.filter((_, attachmentIndex) => attachmentIndex !== index),
+            }));
+          }}
+          resetKey={`${type}:${initialKey}`}
+          type={type}
+        />
+        {errors.details === undefined ? null : <Text style={styles.error}>{errors.details}</Text>}
+
+        <View>
+          <Text style={styles.label}>备注（可选）</Text>
+          <TextInput
+            accessibilityLabel="备注（可选）"
+            multiline
+            onChangeText={(note) => setValue((current) => ({ ...current, note }))}
+            placeholder="记录一些细节"
+            style={[styles.input, styles.noteInput]}
+            value={value.note}
+          />
+        </View>
+
+        {errors.save === undefined ? null : <Text style={styles.error}>{errors.save}</Text>}
+        <Pressable
+          accessibilityRole="button"
+          disabled={saving}
+          onPress={() => void handleSave()}
+          style={[styles.saveButton, saving && styles.saveButtonDisabled]}
+        >
+          <Text style={styles.saveButtonText}>{saving ? '保存中…' : '保存'}</Text>
+        </Pressable>
+      </ScrollView>
+    </KeyboardAvoidingView>
   );
 }
 
@@ -311,7 +332,8 @@ function isIsoTimestamp(value: string): boolean {
 }
 
 const styles = StyleSheet.create({
-  form: { backgroundColor: colors.background, flex: 1, gap: spacing.md, padding: spacing.lg },
+  keyboardAvoiding: { backgroundColor: colors.background, flex: 1 },
+  form: { flexGrow: 1, gap: spacing.md, padding: spacing.lg },
   label: { color: colors.text, fontSize: 15, fontWeight: '600', marginBottom: spacing.sm },
   input: {
     backgroundColor: colors.card,

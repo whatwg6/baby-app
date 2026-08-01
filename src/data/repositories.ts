@@ -25,15 +25,38 @@ export interface RecordTransaction {
   delete(id: string): Promise<Attachment[]>;
 }
 
+export interface RecordPageCursor {
+  occurredAt: string;
+  createdAt: string;
+  id: string;
+}
+
+export interface RecordListOptions {
+  types?: RecordType[];
+  cursor?: RecordPageCursor | null;
+  limit?: number;
+}
+
+export interface RecordPage {
+  records: TimelineRecord[];
+  nextCursor: RecordPageCursor | null;
+}
+
 export interface RecordRepository extends RecordTransaction {
   list(filter?: { types?: RecordType[] }): Promise<TimelineRecord[]>;
+  listPage(options?: RecordListOptions): Promise<RecordPage>;
   get(id: string): Promise<TimelineRecord | null>;
   withTransaction<T>(work: (transaction: RecordTransaction) => Promise<T>): Promise<T>;
+}
+
+export interface MediaReferenceRepository {
+  listReferencedMediaPaths(): Promise<string[]>;
 }
 
 export interface SQLiteRepositories {
   babies: BabyRepository;
   records: RecordRepository;
+  mediaReferences: MediaReferenceRepository;
 }
 
 type RecordRow = {
@@ -63,6 +86,10 @@ type AttachmentRow = {
   thumbnail_path: string | null;
   created_at: string;
 };
+
+type GrowthDetailsRow = GrowthDetails & { recordId: string };
+type ActivityDetailsRow = ActivityDetails & { recordId: string };
+type MilestoneDetailsRow = MilestoneDetails & { recordId: string };
 
 class SQLiteBabyRepository implements BabyRepository {
   constructor(private readonly database: SQLiteDatabase) {}
@@ -195,9 +222,9 @@ class SQLiteRecordRepository implements RecordRepository {
       const rows = await this.database.getAllAsync<RecordRow>(`
         SELECT id, type, occurred_at, note, created_at, updated_at
         FROM records
-        ORDER BY occurred_at DESC, created_at DESC;
+        ORDER BY occurred_at DESC, created_at DESC, id DESC;
       `);
-      return Promise.all(rows.map((row) => requireRecord(this.database, row.id)));
+      return hydrateRecords(this.database, rows);
     }
 
     const placeholders = types.map(() => '?').join(', ');
@@ -205,9 +232,56 @@ class SQLiteRecordRepository implements RecordRepository {
       SELECT id, type, occurred_at, note, created_at, updated_at
       FROM records
       WHERE type IN (${placeholders})
-      ORDER BY occurred_at DESC, created_at DESC;
+      ORDER BY occurred_at DESC, created_at DESC, id DESC;
     `, types);
-    return Promise.all(rows.map((row) => requireRecord(this.database, row.id)));
+    return hydrateRecords(this.database, rows);
+  }
+
+  async listPage(options: RecordListOptions = {}): Promise<RecordPage> {
+    const types = options.types ?? [];
+    const cursor = options.cursor ?? null;
+    const limit = normalizePageLimit(options.limit);
+    const clauses: string[] = [];
+    const parameters: Array<string | number> = [];
+
+    if (types.length > 0) {
+      clauses.push(`type IN (${types.map(() => '?').join(', ')})`);
+      parameters.push(...types);
+    }
+    if (cursor !== null) {
+      clauses.push(`(
+        occurred_at < ?
+        OR (occurred_at = ? AND created_at < ?)
+        OR (occurred_at = ? AND created_at = ? AND id < ?)
+      )`);
+      parameters.push(
+        cursor.occurredAt,
+        cursor.occurredAt,
+        cursor.createdAt,
+        cursor.occurredAt,
+        cursor.createdAt,
+        cursor.id,
+      );
+    }
+
+    const where = clauses.length === 0 ? '' : `WHERE ${clauses.join(' AND ')}`;
+    const rows = await this.database.getAllAsync<RecordRow>(`
+      SELECT id, type, occurred_at, note, created_at, updated_at
+      FROM records
+      ${where}
+      ORDER BY occurred_at DESC, created_at DESC, id DESC
+      LIMIT ?;
+    `, [...parameters, limit + 1]);
+    const pageRows = rows.slice(0, limit);
+    const records = await hydrateRecords(this.database, pageRows);
+    const lastRow = pageRows.at(-1);
+
+    return {
+      records,
+      nextCursor: rows.length > limit && lastRow !== undefined
+        ? toRecordPageCursor(lastRow)
+        : null,
+    };
   }
 
   get(id: string): Promise<TimelineRecord | null> {
@@ -226,10 +300,177 @@ class SQLiteRecordRepository implements RecordRepository {
   }
 }
 
+class SQLiteMediaReferenceRepository implements MediaReferenceRepository {
+  constructor(private readonly database: SQLiteDatabase) {}
+
+  async listReferencedMediaPaths(): Promise<string[]> {
+    const rows = await this.database.getAllAsync<{ path: string }>(`
+      SELECT avatar_path AS path FROM baby WHERE avatar_path IS NOT NULL
+      UNION ALL
+      SELECT file_path AS path FROM attachments
+      UNION ALL
+      SELECT thumbnail_path AS path FROM attachments WHERE thumbnail_path IS NOT NULL;
+    `);
+    return [...new Set(rows.map((row) => row.path))];
+  }
+}
+
+function normalizePageLimit(limit: number | undefined): number {
+  if (limit === undefined || !Number.isFinite(limit)) {
+    return 20;
+  }
+  return Math.max(1, Math.min(100, Math.trunc(limit)));
+}
+
+function toRecordPageCursor(row: RecordRow): RecordPageCursor {
+  return {
+    occurredAt: row.occurred_at,
+    createdAt: row.created_at,
+    id: row.id,
+  };
+}
+
+async function hydrateRecords(
+  database: SQLiteDatabase,
+  rows: RecordRow[],
+): Promise<TimelineRecord[]> {
+  if (rows.length === 0) {
+    return [];
+  }
+
+  const growthIds = rows.filter((row) => row.type === 'growth').map((row) => row.id);
+  const activityIds = rows.filter((row) => row.type === 'activity').map((row) => row.id);
+  const milestoneIds = rows.filter((row) => row.type === 'milestone').map((row) => row.id);
+  const recordIds = rows.map((row) => row.id);
+  const [growthRows, activityRows, milestoneRows, attachmentRows] = await Promise.all([
+    listGrowthDetails(database, growthIds),
+    listActivityDetails(database, activityIds),
+    listMilestoneDetails(database, milestoneIds),
+    listAttachmentsForRecords(database, recordIds),
+  ]);
+  const growthByRecord = new Map(growthRows.map((details) => [details.recordId, details]));
+  const activityByRecord = new Map(activityRows.map((details) => [details.recordId, details]));
+  const milestoneByRecord = new Map(milestoneRows.map((details) => [details.recordId, details]));
+  const attachmentsByRecord = new Map<string, Attachment[]>();
+  for (const attachmentRow of attachmentRows) {
+    const attachments = attachmentsByRecord.get(attachmentRow.record_id) ?? [];
+    attachments.push(toAttachment(attachmentRow));
+    attachmentsByRecord.set(attachmentRow.record_id, attachments);
+  }
+
+  return rows.map((row) => ({
+    id: row.id,
+    type: row.type,
+    occurredAt: row.occurred_at,
+    note: row.note,
+    details: batchDetails(row, growthByRecord, activityByRecord, milestoneByRecord),
+    attachments: attachmentsByRecord.get(row.id) ?? [],
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }));
+}
+
+async function listGrowthDetails(
+  database: SQLiteDatabase,
+  recordIds: string[],
+): Promise<GrowthDetailsRow[]> {
+  if (recordIds.length === 0) {
+    return [];
+  }
+  return database.getAllAsync<GrowthDetailsRow>(`
+    SELECT record_id AS recordId,
+           height_cm AS heightCm,
+           weight_kg AS weightKg,
+           head_cm AS headCm
+    FROM growth_details
+    WHERE record_id IN (${recordIds.map(() => '?').join(', ')});
+  `, recordIds);
+}
+
+async function listActivityDetails(
+  database: SQLiteDatabase,
+  recordIds: string[],
+): Promise<ActivityDetailsRow[]> {
+  if (recordIds.length === 0) {
+    return [];
+  }
+  return database.getAllAsync<ActivityDetailsRow>(`
+    SELECT record_id AS recordId,
+           activity_type AS activityType,
+           amount,
+           duration_minutes AS durationMinutes
+    FROM activity_details
+    WHERE record_id IN (${recordIds.map(() => '?').join(', ')});
+  `, recordIds);
+}
+
+async function listMilestoneDetails(
+  database: SQLiteDatabase,
+  recordIds: string[],
+): Promise<MilestoneDetailsRow[]> {
+  if (recordIds.length === 0) {
+    return [];
+  }
+  return database.getAllAsync<MilestoneDetailsRow>(`
+    SELECT record_id AS recordId, title, preset_key AS presetKey
+    FROM milestone_details
+    WHERE record_id IN (${recordIds.map(() => '?').join(', ')});
+  `, recordIds);
+}
+
+async function listAttachmentsForRecords(
+  database: SQLiteDatabase,
+  recordIds: string[],
+): Promise<AttachmentRow[]> {
+  return database.getAllAsync<AttachmentRow>(`
+    SELECT id, record_id, media_type, file_path, thumbnail_path, created_at
+    FROM attachments
+    WHERE record_id IN (${recordIds.map(() => '?').join(', ')})
+    ORDER BY record_id ASC, created_at ASC, id ASC;
+  `, recordIds);
+}
+
+function batchDetails(
+  row: RecordRow,
+  growthByRecord: Map<string, GrowthDetailsRow>,
+  activityByRecord: Map<string, ActivityDetailsRow>,
+  milestoneByRecord: Map<string, MilestoneDetailsRow>,
+): TimelineRecord['details'] {
+  switch (row.type) {
+    case 'moment':
+      return null;
+    case 'growth': {
+      const details = growthByRecord.get(row.id);
+      if (details === undefined) {
+        throw new Error(`Growth record ${row.id} has no details.`);
+      }
+      const { recordId: _recordId, ...value } = details;
+      return value;
+    }
+    case 'activity': {
+      const details = activityByRecord.get(row.id);
+      if (details === undefined) {
+        throw new Error(`Activity record ${row.id} has no details.`);
+      }
+      const { recordId: _recordId, ...value } = details;
+      return value;
+    }
+    case 'milestone': {
+      const details = milestoneByRecord.get(row.id);
+      if (details === undefined) {
+        throw new Error(`Milestone record ${row.id} has no details.`);
+      }
+      const { recordId: _recordId, ...value } = details;
+      return value;
+    }
+  }
+}
+
 export function createSQLiteRepositories(database: SQLiteDatabase): SQLiteRepositories {
   return {
     babies: new SQLiteBabyRepository(database),
     records: new SQLiteRecordRepository(database),
+    mediaReferences: new SQLiteMediaReferenceRepository(database),
   };
 }
 

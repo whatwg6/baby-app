@@ -4,6 +4,16 @@ import * as ImagePicker from 'expo-image-picker';
 import { MediaPicker } from '../MediaPicker';
 import { MediaPreview } from '../MediaPreview';
 
+const mockVideoPlay = jest.fn();
+
+jest.mock('expo-video', () => {
+  const { View } = require('react-native') as typeof import('react-native');
+  return {
+    useVideoPlayer: () => ({ play: mockVideoPlay }),
+    VideoView: (props: Record<string, unknown>) => <View {...props} />,
+  };
+});
+
 jest.mock('expo-image-picker', () => ({
   requestMediaLibraryPermissionsAsync: jest.fn(),
   launchImageLibraryAsync: jest.fn(),
@@ -93,4 +103,14 @@ test('shows a placeholder when an image preview fails to load', async () => {
   await fireEvent(view.getByLabelText('媒体预览'), 'error');
 
   expect(view.getByLabelText('媒体文件不可用')).toBeTruthy();
+});
+
+test('plays a private video attachment in the preview instead of rendering a placeholder', async () => {
+  const view = await render(
+    <MediaPreview mediaType="video" uri="file:///documents/media/first-step.mp4" />,
+  );
+
+  expect(view.queryByText('媒体文件不可用')).toBeNull();
+  await fireEvent.press(view.getByRole('button', { name: '播放视频' }));
+  expect(mockVideoPlay).toHaveBeenCalledTimes(1);
 });
