@@ -1,26 +1,13 @@
-import { StyleSheet, Text, View } from 'react-native';
+import { useRouter, type Href } from 'expo-router';
 
-import { colors, spacing } from '../../src/ui/theme';
+import { RecordTypePicker } from '../../src/features/records/RecordTypePicker';
 
 export default function AddScreen() {
+  const router = useRouter();
+
   return (
-    <View style={styles.container}>
-      <Text style={styles.title}>选择记录类型</Text>
-    </View>
+    <RecordTypePicker onSelect={(type) => {
+      router.push(`/record/new?type=${type}` as Href);
+    }} />
   );
 }
-
-const styles = StyleSheet.create({
-  container: {
-    alignItems: 'center',
-    backgroundColor: colors.background,
-    flex: 1,
-    justifyContent: 'center',
-    padding: spacing.lg,
-  },
-  title: {
-    color: colors.text,
-    fontSize: 20,
-    fontWeight: '600',
-  },
-});
