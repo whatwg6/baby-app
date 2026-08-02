@@ -28,7 +28,7 @@ RecordDetails _$RecordDetailsFromJson(
           return MilestoneDetails.fromJson(
             json
           );
-
+        
           default:
             throw CheckedFromJsonException(
   json,
@@ -37,7 +37,7 @@ RecordDetails _$RecordDetailsFromJson(
   'Invalid union type "${json['runtimeType']}"!'
 );
         }
-
+      
 }
 
 /// @nodoc

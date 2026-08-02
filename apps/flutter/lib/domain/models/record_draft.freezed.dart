@@ -24,7 +24,7 @@ RecordDraftAttachment _$RecordDraftAttachmentFromJson(
           return ExistingAttachment.fromJson(
             json
           );
-
+        
           default:
             throw CheckedFromJsonException(
   json,
@@ -33,7 +33,7 @@ RecordDraftAttachment _$RecordDraftAttachmentFromJson(
   'Invalid union type "${json['runtimeType']}"!'
 );
         }
-
+      
 }
 
 /// @nodoc

@@ -81,7 +81,7 @@ as List<BackupFileEntry>,
 @override
 @pragma('vm:prefer-inline')
 $BackupFileEntryCopyWith<$Res> get database {
-
+  
   return $BackupFileEntryCopyWith<$Res>(_self.database, (value) {
     return _then(_self.copyWith(database: value));
   });
@@ -304,7 +304,7 @@ as List<BackupFileEntry>,
 @override
 @pragma('vm:prefer-inline')
 $BackupFileEntryCopyWith<$Res> get database {
-
+  
   return $BackupFileEntryCopyWith<$Res>(_self.database, (value) {
     return _then(_self.copyWith(database: value));
   });
