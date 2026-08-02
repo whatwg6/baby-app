@@ -85,6 +85,23 @@ void main() {
     }
   });
 
+  test(
+    'database opens when journal mode pragmas must use the query API',
+    () async {
+      final compatibilityPath = path.join(
+        temporaryDirectory.path,
+        'darwin-pragma-compatibility.sqlite',
+      );
+      final compatibilityDatabase = await AppDatabase.open(
+        path: compatibilityPath,
+        databaseFactory: _DarwinPragmaCompatibilityFactory(databaseFactoryFfi),
+      );
+
+      expect(compatibilityDatabase.isOpen, isTrue);
+      await compatibilityDatabase.close();
+    },
+  );
+
   test('every detail table permits only one row per record', () async {
     await appDatabase.write((database) async {
       await database.insert('records', {
@@ -393,4 +410,75 @@ class _FailingOpenDatabaseFactory implements DatabaseFactory {
   @override
   Future<void> writeDatabaseBytes(String path, Uint8List bytes) =>
       delegate.writeDatabaseBytes(path, bytes);
+}
+
+class _DarwinPragmaCompatibilityFactory implements DatabaseFactory {
+  _DarwinPragmaCompatibilityFactory(this.delegate);
+
+  final DatabaseFactory delegate;
+
+  @override
+  Future<Database> openDatabase(
+    String path, {
+    OpenDatabaseOptions? options,
+  }) async {
+    final onConfigure = options?.onConfigure;
+    if (onConfigure != null) {
+      await onConfigure(_DarwinPragmaCompatibilityDatabase());
+    }
+    return delegate.openDatabase(
+      path,
+      options: OpenDatabaseOptions(
+        version: options?.version,
+        onCreate: options?.onCreate,
+        onUpgrade: options?.onUpgrade,
+        onDowngrade: options?.onDowngrade,
+        onOpen: options?.onOpen,
+        readOnly: options?.readOnly ?? false,
+        singleInstance: options?.singleInstance ?? true,
+      ),
+    );
+  }
+
+  @override
+  Future<bool> databaseExists(String path) => delegate.databaseExists(path);
+
+  @override
+  Future<void> deleteDatabase(String path) => delegate.deleteDatabase(path);
+
+  @override
+  Future<String> getDatabasesPath() => delegate.getDatabasesPath();
+
+  @override
+  Future<Uint8List> readDatabaseBytes(String path) =>
+      delegate.readDatabaseBytes(path);
+
+  @override
+  Future<void> setDatabasesPath(String path) => delegate.setDatabasesPath(path);
+
+  @override
+  Future<void> writeDatabaseBytes(String path, Uint8List bytes) =>
+      delegate.writeDatabaseBytes(path, bytes);
+}
+
+class _DarwinPragmaCompatibilityDatabase implements Database {
+  @override
+  Future<void> execute(String sql, [List<Object?>? arguments]) async {
+    if (sql == 'PRAGMA journal_mode = WAL') {
+      throw StateError('Darwin execute cannot consume pragma rows');
+    }
+  }
+
+  @override
+  Future<List<Map<String, Object?>>> rawQuery(
+    String sql, [
+    List<Object?>? arguments,
+  ]) async => sql == 'PRAGMA journal_mode = WAL'
+      ? const [
+          <String, Object?>{'journal_mode': 'wal'},
+        ]
+      : const [];
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }

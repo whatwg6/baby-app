@@ -1469,7 +1469,7 @@ class LocalBackupService implements BackupService {
           singleInstance: false,
           onConfigure: (database) async {
             await database.execute('PRAGMA foreign_keys = ON');
-            await database.execute('PRAGMA journal_mode = WAL');
+            await database.rawQuery('PRAGMA journal_mode = WAL');
           },
           onCreate: (database, version) =>
               migrateDatabase(database, 0, version),
