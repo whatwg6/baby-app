@@ -57,11 +57,29 @@ class AppDatabase implements DatabaseLifecycle {
     await database.close();
     _database = null;
 
+    late T result;
+    Object? operationError;
+    StackTrace? operationStackTrace;
     try {
-      return await work(path);
-    } finally {
-      await _reopenUnlocked();
+      result = await work(path);
+    } catch (error, stackTrace) {
+      operationError = error;
+      operationStackTrace = stackTrace;
     }
+    try {
+      await _reopenUnlocked();
+    } catch (reopenError, reopenStackTrace) {
+      throw DatabaseLifecycleReopenException(
+        operationError: operationError,
+        operationStackTrace: operationStackTrace,
+        reopenError: reopenError,
+        reopenStackTrace: reopenStackTrace,
+      );
+    }
+    if (operationError != null) {
+      Error.throwWithStackTrace(operationError, operationStackTrace!);
+    }
+    return result;
   }
 
   @override

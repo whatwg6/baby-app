@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:baby_growth_timeline/data/database/app_database.dart';
+import 'package:baby_growth_timeline/data/database/database_lifecycle.dart';
 import 'package:baby_growth_timeline/data/database/migrations.dart';
 import 'package:baby_growth_timeline/data/repositories/sqlite_record_repository.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -329,4 +331,66 @@ void main() {
       expect(appDatabase.isOpen, isTrue);
     },
   );
+
+  test('closed lifecycle preserves callback and reopen failures', () async {
+    final failingFactory = _FailingOpenDatabaseFactory(databaseFactoryFfi);
+    final failingDatabase = await AppDatabase.open(
+      path: path.join(temporaryDirectory.path, 'reopen-failure.sqlite'),
+      databaseFactory: failingFactory,
+    );
+    failingFactory.failNextOpen = true;
+
+    DatabaseLifecycleReopenException? failure;
+    try {
+      await failingDatabase.withClosedDatabase<void>((_) async {
+        throw StateError('callback failed');
+      });
+    } on DatabaseLifecycleReopenException catch (error) {
+      failure = error;
+    }
+
+    expect(failure, isNotNull);
+    expect(failure!.operationError, isA<StateError>());
+    expect(failure.reopenError, isA<StateError>());
+    expect(failingDatabase.isOpen, isFalse);
+
+    await failingDatabase.reopen();
+    await failingDatabase.close();
+  });
+}
+
+class _FailingOpenDatabaseFactory implements DatabaseFactory {
+  _FailingOpenDatabaseFactory(this.delegate);
+
+  final DatabaseFactory delegate;
+  bool failNextOpen = false;
+
+  @override
+  Future<Database> openDatabase(String path, {OpenDatabaseOptions? options}) {
+    if (failNextOpen) {
+      failNextOpen = false;
+      throw StateError('reopen failed');
+    }
+    return delegate.openDatabase(path, options: options);
+  }
+
+  @override
+  Future<bool> databaseExists(String path) => delegate.databaseExists(path);
+
+  @override
+  Future<void> deleteDatabase(String path) => delegate.deleteDatabase(path);
+
+  @override
+  Future<String> getDatabasesPath() => delegate.getDatabasesPath();
+
+  @override
+  Future<Uint8List> readDatabaseBytes(String path) =>
+      delegate.readDatabaseBytes(path);
+
+  @override
+  Future<void> setDatabasesPath(String path) => delegate.setDatabasesPath(path);
+
+  @override
+  Future<void> writeDatabaseBytes(String path, Uint8List bytes) =>
+      delegate.writeDatabaseBytes(path, bytes);
 }

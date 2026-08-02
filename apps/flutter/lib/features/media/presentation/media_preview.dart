@@ -11,27 +11,31 @@ class MediaPreview extends StatelessWidget {
     required this.mediaType,
     this.thumbnailPath,
     this.imageProvider,
+    this.unavailableBuilder,
     this.width = 88,
     this.height = 88,
+    this.borderRadius = const BorderRadius.all(Radius.circular(8)),
   });
 
   final String filePath;
   final String? thumbnailPath;
   final MediaType mediaType;
   final ImageProvider<Object>? imageProvider;
+  final WidgetBuilder? unavailableBuilder;
   final double width;
   final double height;
+  final BorderRadius borderRadius;
 
   @override
   Widget build(BuildContext context) {
     if (!File(filePath).existsSync()) {
-      return _UnavailableMedia(width: width, height: height);
+      return _buildUnavailable(context);
     }
     final previewPath = mediaType == MediaType.video
         ? thumbnailPath
         : thumbnailPath ?? filePath;
     if (previewPath == null || !File(previewPath).existsSync()) {
-      return _UnavailableMedia(width: width, height: height);
+      return _buildUnavailable(context);
     }
     return SizedBox(
       width: width,
@@ -40,13 +44,13 @@ class MediaPreview extends StatelessWidget {
         fit: StackFit.expand,
         children: [
           ClipRRect(
-            borderRadius: BorderRadius.circular(8),
+            borderRadius: borderRadius,
             child: Image(
               image: imageProvider ?? FileImage(File(previewPath)),
               fit: BoxFit.cover,
               gaplessPlayback: true,
               errorBuilder: (context, error, stackTrace) =>
-                  _UnavailableMedia(width: width, height: height),
+                  _buildUnavailable(context),
             ),
           ),
           if (mediaType == MediaType.video)
@@ -66,6 +70,14 @@ class MediaPreview extends StatelessWidget {
       ),
     );
   }
+
+  Widget _buildUnavailable(BuildContext context) => SizedBox(
+    width: width,
+    height: height,
+    child:
+        unavailableBuilder?.call(context) ??
+        _UnavailableMedia(width: width, height: height),
+  );
 }
 
 class _UnavailableMedia extends StatelessWidget {

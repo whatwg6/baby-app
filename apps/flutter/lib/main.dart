@@ -1,8 +1,15 @@
 import 'package:baby_growth_timeline/app/app.dart';
-import 'package:baby_growth_timeline/app/router.dart';
+import 'package:baby_growth_timeline/app/bootstrap.dart';
 import 'package:flutter/widgets.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 void main() {
-  runApp(ProviderScope(child: BabyTimelineApp(router: createRouter())));
+  WidgetsFlutterBinding.ensureInitialized();
+  final debugLogger = LocalDebugLogger();
+  installLocalFlutterErrorLogging(debugLogger);
+  runApp(
+    BabyTimelineBootstrap(
+      bootstrap: () =>
+          bootstrapApp(LocalBootstrapEnvironment(debugLogger: debugLogger)),
+    ),
+  );
 }

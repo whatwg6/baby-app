@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../../data/repositories/record_repository.dart';
+import '../../../domain/destructive_operation_gate.dart';
 import '../../media/domain/media_service.dart';
 
 typedef OrphanCleanupQueue = Future<void> Function(Set<String> paths);
@@ -11,6 +12,7 @@ class DeleteRecordButton extends StatefulWidget {
     required this.recordId,
     required this.repository,
     required this.mediaService,
+    required this.destructiveOperationGate,
     required this.queueOrphanCleanup,
     this.onDeleted,
   });
@@ -18,6 +20,7 @@ class DeleteRecordButton extends StatefulWidget {
   final String recordId;
   final RecordRepository repository;
   final MediaService mediaService;
+  final DestructiveOperationGate destructiveOperationGate;
   final OrphanCleanupQueue queueOrphanCleanup;
   final Future<void> Function()? onDeleted;
 
@@ -55,15 +58,38 @@ class _DeleteRecordButtonState extends State<DeleteRecordButton> {
     if (confirmed != true || !mounted) return;
     setState(() => _deleting = true);
 
-    late final Set<String> paths;
-    try {
-      final attachments = await widget.repository.delete(widget.recordId);
-      paths = <String>{
-        for (final attachment in attachments) attachment.filePath,
-        for (final attachment in attachments)
-          if (attachment.thumbnailPath != null) attachment.thumbnailPath!,
-      };
-    } catch (_) {
+    var databaseFailed = false;
+    var cleanupQueued = false;
+    var queueFailed = false;
+    await widget.destructiveOperationGate.run(() async {
+      late final Set<String> paths;
+      try {
+        final attachments = await widget.repository.delete(widget.recordId);
+        paths = <String>{
+          for (final attachment in attachments) attachment.filePath,
+          for (final attachment in attachments)
+            if (attachment.thumbnailPath != null) attachment.thumbnailPath!,
+        };
+      } catch (_) {
+        databaseFailed = true;
+        return;
+      }
+
+      if (paths.isNotEmpty) {
+        try {
+          await widget.mediaService.remove(paths);
+        } catch (_) {
+          try {
+            await widget.queueOrphanCleanup(paths);
+            cleanupQueued = true;
+          } catch (_) {
+            queueFailed = true;
+          }
+        }
+      }
+    });
+
+    if (databaseFailed) {
       if (mounted) {
         ScaffoldMessenger.of(
           context,
@@ -71,21 +97,6 @@ class _DeleteRecordButtonState extends State<DeleteRecordButton> {
       }
       if (mounted) setState(() => _deleting = false);
       return;
-    }
-
-    var cleanupQueued = false;
-    var queueFailed = false;
-    if (paths.isNotEmpty) {
-      try {
-        await widget.mediaService.remove(paths);
-      } catch (_) {
-        try {
-          await widget.queueOrphanCleanup(paths);
-          cleanupQueued = true;
-        } catch (_) {
-          queueFailed = true;
-        }
-      }
     }
     try {
       await widget.onDeleted?.call();

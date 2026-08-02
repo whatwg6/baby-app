@@ -4,8 +4,11 @@ import 'package:baby_growth_timeline/core/errors/app_exception.dart';
 import 'package:baby_growth_timeline/data/database/app_database.dart';
 import 'package:baby_growth_timeline/data/repositories/sqlite_baby_repository.dart';
 import 'package:baby_growth_timeline/data/repositories/sqlite_record_repository.dart';
+import 'package:baby_growth_timeline/domain/models/baby.dart';
 import 'package:baby_growth_timeline/domain/models/record_draft.dart';
 import 'package:baby_growth_timeline/domain/models/timeline_record.dart';
+import 'package:baby_growth_timeline/features/baby/presentation/baby_form.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as path;
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -40,6 +43,41 @@ void main() {
 
   group('SqliteRecordRepository contract', () {
     recordRepositoryContract(() async => SqliteRecordRepository(appDatabase));
+  });
+
+  testWidgets('profile form round-trips optional sex through SQLite', (
+    tester,
+  ) async {
+    final repository = SqliteBabyRepository(appDatabase);
+    BabyDraft? submitted;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: BabyForm(
+            onSave: (draft) async {
+              submitted = draft;
+            },
+            now: () => DateTime(2026, 8, 1),
+          ),
+        ),
+      ),
+    );
+
+    await tester.enterText(find.byKey(const Key('baby-name')), '安安');
+    await tester.enterText(find.byKey(const Key('birth-date')), '2025-06-15');
+    await tester.tap(find.byKey(const Key('baby-sex')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('女').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('保存'));
+    await tester.pump();
+
+    expect(submitted, isNotNull);
+    final stored = await tester.runAsync(() async {
+      await repository.create(submitted!);
+      return repository.getCurrent();
+    });
+    expect(stored?.sex, '女');
   });
 
   test('persists instants as canonical UTC ISO 8601 strings', () async {

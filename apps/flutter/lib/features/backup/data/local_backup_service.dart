@@ -12,15 +12,21 @@ import 'package:uuid/uuid.dart';
 
 import '../../../data/database/database_lifecycle.dart';
 import '../../../data/database/migrations.dart';
+import '../../../domain/destructive_operation_gate.dart';
 import '../domain/backup_manifest.dart';
 import '../domain/backup_service.dart';
 
 export '../domain/backup_service.dart'
-    show BackupException, BackupRollbackException, BackupShareException;
+    show
+        BackupException,
+        BackupReopenException,
+        BackupRollbackException,
+        BackupShareException;
 
 typedef BackupPathRenamer =
     Future<void> Function(String source, String destination);
 typedef BackupDirectoryDeleter = Future<void> Function(Directory directory);
+typedef BackupArchiveCopyObserver = Future<void> Function(int copiedBytes);
 
 enum BackupRestoreStep {
   beforeCurrentDatabaseMove,
@@ -50,6 +56,7 @@ class BackupArchiveLimits {
 class LocalBackupService implements BackupService {
   LocalBackupService({
     required this.databaseLifecycle,
+    required this.destructiveOperationGate,
     DatabaseFactory? databaseFactory,
     Future<Directory> Function()? applicationSupportDirectory,
     Future<Directory> Function()? inspectionDirectory,
@@ -60,6 +67,7 @@ class LocalBackupService implements BackupService {
     this.onRestoreStep,
     BackupPathRenamer? renamePath,
     BackupDirectoryDeleter? deleteDirectory,
+    this.onArchiveCopyChunk,
   }) : _databaseFactory = databaseFactory ?? databaseFactorySqflitePlugin,
        _applicationSupportDirectory =
            applicationSupportDirectory ?? getApplicationSupportDirectory,
@@ -75,6 +83,7 @@ class LocalBackupService implements BackupService {
   static const databaseArchivePath = 'database/app.db';
 
   final DatabaseLifecycle databaseLifecycle;
+  final DestructiveOperationGate destructiveOperationGate;
   final DatabaseFactory _databaseFactory;
   final Future<Directory> Function() _applicationSupportDirectory;
   final Future<Directory> Function() _inspectionDirectory;
@@ -85,6 +94,7 @@ class LocalBackupService implements BackupService {
   final Future<void> Function(BackupRestoreStep step)? onRestoreStep;
   final BackupPathRenamer _renamePath;
   final BackupDirectoryDeleter _deleteDirectory;
+  final BackupArchiveCopyObserver? onArchiveCopyChunk;
   final Map<BackupInspection, _InspectionBinding> _bindings =
       Map<BackupInspection, _InspectionBinding>.identity();
 
@@ -158,6 +168,21 @@ class LocalBackupService implements BackupService {
         database: databaseEntry,
         media: mediaEntries,
       );
+      final manifestBytes = utf8.encode(jsonEncode(manifest.toJson()));
+      if (fileEntries.length + 1 > limits.maxEntries) {
+        throw const BackupException('备份条目数量超过限制。');
+      }
+      if (manifestBytes.length > limits.maxManifestBytes ||
+          manifestBytes.length > limits.maxEntryBytes) {
+        throw const BackupException('备份清单超过大小限制。');
+      }
+      final totalBytes = fileEntries.fold<int>(
+        manifestBytes.length,
+        (total, entry) => total + entry.size,
+      );
+      if (totalBytes > limits.maxTotalBytes) {
+        throw const BackupException('备份总大小超过限制。');
+      }
 
       final timestamp = _now().toUtc().toIso8601String().replaceAll(
         RegExp(r'[^0-9]'),
@@ -170,9 +195,7 @@ class LocalBackupService implements BackupService {
       final temporaryPath = '$finalPath.partial';
       partialArchive = temporaryPath;
       final archive = Archive()
-        ..addFile(
-          ArchiveFile.string(manifestPath, jsonEncode(manifest.toJson())),
-        );
+        ..addFile(ArchiveFile.bytes(manifestPath, manifestBytes));
       for (final entry in fileEntries) {
         archive.addFile(
           ArchiveFile.stream(
@@ -214,24 +237,37 @@ class LocalBackupService implements BackupService {
   @override
   Future<BackupInspection> inspect(String archivePath) async {
     Directory? temporary;
+    Directory? archiveSnapshotDirectory;
     InputFileStream? archiveInput;
     try {
       if (!archivePath.endsWith(archiveExtension)) {
         throw const BackupException('备份文件扩展名无效。');
       }
-      final archiveFile = File(archivePath);
+      final sourceArchive = File(archivePath);
       if (await FileSystemEntity.type(archivePath, followLinks: false) !=
           FileSystemEntityType.file) {
         throw const BackupException('备份文件不存在或不是普通文件。');
       }
-      final archiveLength = await archiveFile.length();
-      if (archiveLength <= 0 || archiveLength > limits.maxArchiveBytes) {
-        throw const BackupException('备份文件大小无效。');
-      }
+      final inspectionRoot = await _validatedDirectory(
+        await _inspectionDirectory(),
+        create: true,
+        label: '备份检查目录',
+      );
+      archiveSnapshotDirectory = Directory(
+        p.join(inspectionRoot.path, 'baby-growth-archive-${_safeId()}'),
+      );
+      await _createUniqueDirectory(archiveSnapshotDirectory);
+      final archiveFile = File(
+        p.join(archiveSnapshotDirectory.path, 'source$archiveExtension'),
+      );
+      final archiveSnapshot = await _copyArchiveSnapshot(
+        sourceArchive,
+        archiveFile,
+      );
       await _preflightZipDirectory(archiveFile);
 
       final decodedEntries = <ArchiveFile>[];
-      archiveInput = InputFileStream(archivePath);
+      archiveInput = InputFileStream(archiveFile.path);
       final archive = ZipDecoder().decodeStream(
         archiveInput,
         callback: decodedEntries.add,
@@ -274,11 +310,6 @@ class LocalBackupService implements BackupService {
         throw const BackupException('备份文件集合与清单不一致。');
       }
 
-      final inspectionRoot = await _validatedDirectory(
-        await _inspectionDirectory(),
-        create: true,
-        label: '备份检查目录',
-      );
       temporary = Directory(
         p.join(inspectionRoot.path, 'baby-growth-inspection-${_safeId()}'),
       );
@@ -309,12 +340,23 @@ class LocalBackupService implements BackupService {
       );
       _bindings[inspection] = _InspectionBinding(
         temporaryDirectory: p.normalize(p.absolute(canonical)),
+        archiveDirectory: p.normalize(
+          p.absolute(await archiveSnapshotDirectory.resolveSymbolicLinks()),
+        ),
+        archivePath: p.normalize(
+          p.absolute(await archiveFile.resolveSymbolicLinks()),
+        ),
+        archiveSize: archiveSnapshot.size,
+        archiveSha256: archiveSnapshot.sha256,
         manifest: manifest,
         manifestSha256: sha256.convert(manifestBytes).toString(),
       );
       return inspection;
     } catch (error) {
       if (temporary != null) await _deleteDirectoryIfPresent(temporary);
+      if (archiveSnapshotDirectory != null) {
+        await _deleteDirectoryIfPresent(archiveSnapshotDirectory);
+      }
       if (error is BackupException) rethrow;
       throw BackupException('检查备份失败', error);
     } finally {
@@ -323,7 +365,10 @@ class LocalBackupService implements BackupService {
   }
 
   @override
-  Future<void> restore(BackupInspection inspected) async {
+  Future<void> restore(BackupInspection inspected) =>
+      destructiveOperationGate.run(() => _restore(inspected));
+
+  Future<void> _restore(BackupInspection inspected) async {
     final binding = _bindings[inspected];
     if (binding == null || !identical(binding.manifest, inspected.manifest)) {
       throw const BackupException('备份检查结果无效或不属于当前会话。');
@@ -402,6 +447,11 @@ class LocalBackupService implements BackupService {
             state.replacementMediaMoved = true;
           }
           await _step(BackupRestoreStep.afterReplacementMediaMove);
+          await _validateInstalledReplacement(
+            databasePath,
+            supportRoot: supportRoot,
+            manifest: inspected.manifest,
+          );
           await _migrateAndVerifyDatabase(
             databasePath,
             supportRoot: supportRoot,
@@ -440,6 +490,35 @@ class LocalBackupService implements BackupService {
         throw BackupException('恢复后的数据无法读取', error);
       }
       // Commit point: cleanup below must never re-enter rollback.
+    } on DatabaseLifecycleReopenException catch (error) {
+      Future<void> reopenAndCleanup() async {
+        await databaseLifecycle.reopen();
+        await _verifyReadableDatabase(state.currentDatabasePath!);
+        if (error.operationError is! BackupRollbackException) {
+          await _deleteDirectoryBestEffort(state.rollbackDirectory);
+        }
+        await _deleteDirectoryBestEffort(temporary);
+        await _deleteDirectoryBestEffort(Directory(binding.archiveDirectory));
+        _bindings.remove(inspected);
+      }
+
+      try {
+        await reopenAndCleanup();
+      } catch (reopenError) {
+        throw BackupReopenException(
+          recoveryPath: state.rollbackDirectory.path,
+          operationError: error.operationError,
+          reopenError: reopenError,
+          retryReopen: reopenAndCleanup,
+        );
+      }
+      final operationError = error.operationError;
+      if (operationError != null) {
+        Error.throwWithStackTrace(
+          operationError,
+          error.operationStackTrace ?? StackTrace.current,
+        );
+      }
     } on BackupRollbackException {
       rethrow;
     } catch (error) {
@@ -456,6 +535,7 @@ class LocalBackupService implements BackupService {
         }
       }
       await _deleteDirectoryBestEffort(temporary);
+      await _deleteDirectoryBestEffort(Directory(binding.archiveDirectory));
       if (state.rolledBack) {
         await _deleteDirectoryBestEffort(state.rollbackDirectory);
       }
@@ -467,6 +547,7 @@ class LocalBackupService implements BackupService {
     _bindings.remove(inspected);
     await _deleteDirectoryBestEffort(state.rollbackDirectory);
     await _deleteDirectoryBestEffort(temporary);
+    await _deleteDirectoryBestEffort(Directory(binding.archiveDirectory));
   }
 
   @override
@@ -520,6 +601,58 @@ class LocalBackupService implements BackupService {
     if (manifestDigest.toString() != binding.manifestSha256) {
       throw const BackupException('备份清单检查结果已被替换。');
     }
+    final archiveDirectory = Directory(binding.archiveDirectory);
+    if (await FileSystemEntity.type(
+          archiveDirectory.path,
+          followLinks: false,
+        ) !=
+        FileSystemEntityType.directory) {
+      throw const BackupException('备份快照目录已被替换。');
+    }
+    final archiveFile = File(binding.archivePath);
+    if (await FileSystemEntity.type(archiveFile.path, followLinks: false) !=
+            FileSystemEntityType.file ||
+        await archiveFile.length() != binding.archiveSize) {
+      throw const BackupException('备份快照已被替换。');
+    }
+    final archiveDigest = await sha256.bind(archiveFile.openRead()).first;
+    if (archiveDigest.toString() != binding.archiveSha256) {
+      throw const BackupException('备份快照已被替换。');
+    }
+  }
+
+  Future<({int size, String sha256})> _copyArchiveSnapshot(
+    File source,
+    File destination,
+  ) async {
+    RandomAccessFile? input;
+    RandomAccessFile? output;
+    var copied = 0;
+    try {
+      input = await source.open();
+      await destination.create(exclusive: true);
+      output = await destination.open(mode: FileMode.writeOnly);
+      const chunkSize = 64 * 1024;
+      while (true) {
+        final bytes = await input.read(chunkSize);
+        if (bytes.isEmpty) break;
+        copied += bytes.length;
+        if (copied > limits.maxArchiveBytes) {
+          throw const BackupException('备份文件超过大小限制。');
+        }
+        await output.writeFrom(bytes);
+        await onArchiveCopyChunk?.call(copied);
+      }
+      await output.flush();
+    } finally {
+      await output?.close();
+      await input?.close();
+    }
+    if (copied <= 0) {
+      throw const BackupException('备份文件大小无效。');
+    }
+    final digest = await sha256.bind(destination.openRead()).first;
+    return (size: copied, sha256: digest.toString());
   }
 
   static Uint8List _readEntryLimited(ArchiveFile entry, int maxBytes) {
@@ -642,6 +775,7 @@ class LocalBackupService implements BackupService {
       var cursor = centralOffset;
       final centralEnd = centralOffset + centralSize;
       var parsedEntries = 0;
+      final centralEntries = <_ZipCentralEntry>[];
       while (cursor < centralEnd) {
         if (centralEnd - cursor < centralHeaderSize) {
           throw const BackupException('备份 ZIP 目录无效。');
@@ -655,10 +789,56 @@ class LocalBackupService implements BackupService {
         if (header.getUint32(0, Endian.little) != centralHeaderSignature) {
           throw const BackupException('备份 ZIP 目录无效。');
         }
-        final variableSize =
-            header.getUint16(28, Endian.little) +
-            header.getUint16(30, Endian.little) +
-            header.getUint16(32, Endian.little);
+        final flags = header.getUint16(8, Endian.little);
+        final method = header.getUint16(10, Endian.little);
+        _validateZipFlagsAndMethod(flags, method);
+        final crc32 = header.getUint32(16, Endian.little);
+        final rawCompressed = header.getUint32(20, Endian.little);
+        final rawUncompressed = header.getUint32(24, Endian.little);
+        final nameLength = header.getUint16(28, Endian.little);
+        final extraLength = header.getUint16(30, Endian.little);
+        final commentLength = header.getUint16(32, Endian.little);
+        final rawDisk = header.getUint16(34, Endian.little);
+        final rawLocalOffset = header.getUint32(42, Endian.little);
+        final variableSize = nameLength + extraLength + commentLength;
+        final variable = await _readFileRange(
+          input,
+          cursor + centralHeaderSize,
+          variableSize,
+        );
+        final name = Uint8List.sublistView(variable, 0, nameLength);
+        if (name.isEmpty) {
+          throw const BackupException('备份 ZIP 文件名无效。');
+        }
+        final extra = Uint8List.sublistView(
+          variable,
+          nameLength,
+          nameLength + extraLength,
+        );
+        final resolved = _resolveCentralZip64(
+          rawUncompressed: rawUncompressed,
+          rawCompressed: rawCompressed,
+          rawLocalOffset: rawLocalOffset,
+          rawDisk: rawDisk,
+          extra: extra,
+        );
+        if (resolved.disk != 0 ||
+            (method == 0 && resolved.compressed != resolved.uncompressed)) {
+          throw const BackupException('备份 ZIP 条目结构无效。');
+        }
+        centralEntries.add(
+          _ZipCentralEntry(
+            name: Uint8List.fromList(name),
+            flags: flags,
+            method: method,
+            crc32: crc32,
+            compressedSize: resolved.compressed,
+            uncompressedSize: resolved.uncompressed,
+            localOffset: resolved.localOffset,
+            zip64Compressed: rawCompressed == 0xffffffff,
+            zip64Uncompressed: rawUncompressed == 0xffffffff,
+          ),
+        );
         cursor += centralHeaderSize + variableSize;
         if (cursor > centralEnd) {
           throw const BackupException('备份 ZIP 目录无效。');
@@ -670,6 +850,60 @@ class LocalBackupService implements BackupService {
       }
       if (parsedEntries != entryCount) {
         throw const BackupException('备份 ZIP 条目计数不一致。');
+      }
+
+      final localRanges = <({int start, int end})>[];
+      for (final entry in centralEntries) {
+        if (entry.localOffset < 0 || entry.localOffset + 30 > centralOffset) {
+          throw const BackupException('备份 ZIP 本地条目越界。');
+        }
+        final localBytes = await _readFileRange(input, entry.localOffset, 30);
+        final local = ByteData.sublistView(localBytes);
+        if (local.getUint32(0, Endian.little) != 0x04034b50) {
+          throw const BackupException('备份 ZIP 本地条目无效。');
+        }
+        final flags = local.getUint16(6, Endian.little);
+        final method = local.getUint16(8, Endian.little);
+        _validateZipFlagsAndMethod(flags, method);
+        final crc32 = local.getUint32(14, Endian.little);
+        final rawCompressed = local.getUint32(18, Endian.little);
+        final rawUncompressed = local.getUint32(22, Endian.little);
+        final nameLength = local.getUint16(26, Endian.little);
+        final extraLength = local.getUint16(28, Endian.little);
+        final variable = await _readFileRange(
+          input,
+          entry.localOffset + 30,
+          nameLength + extraLength,
+        );
+        final name = Uint8List.sublistView(variable, 0, nameLength);
+        final extra = Uint8List.sublistView(variable, nameLength);
+        final sizes = _resolveLocalZip64(
+          rawUncompressed: rawUncompressed,
+          rawCompressed: rawCompressed,
+          extra: extra,
+        );
+        if (flags != entry.flags ||
+            method != entry.method ||
+            crc32 != entry.crc32 ||
+            !_equalBytes(name, entry.name) ||
+            sizes.compressed != entry.compressedSize ||
+            sizes.uncompressed != entry.uncompressedSize ||
+            (rawCompressed == 0xffffffff) != entry.zip64Compressed ||
+            (rawUncompressed == 0xffffffff) != entry.zip64Uncompressed) {
+          throw const BackupException('备份 ZIP 中央与本地条目不一致。');
+        }
+        final dataStart = entry.localOffset + 30 + nameLength + extraLength;
+        final dataEnd = dataStart + entry.compressedSize;
+        if (dataStart < entry.localOffset || dataEnd > centralOffset) {
+          throw const BackupException('备份 ZIP 条目数据越界。');
+        }
+        localRanges.add((start: entry.localOffset, end: dataEnd));
+      }
+      localRanges.sort((left, right) => left.start.compareTo(right.start));
+      for (var index = 1; index < localRanges.length; index += 1) {
+        if (localRanges[index].start < localRanges[index - 1].end) {
+          throw const BackupException('备份 ZIP 本地条目重叠。');
+        }
       }
     } finally {
       await input.close();
@@ -690,6 +924,149 @@ class LocalBackupService implements BackupService {
       throw const BackupException('备份 ZIP 目录无效。');
     }
     return bytes;
+  }
+
+  static void _validateZipFlagsAndMethod(int flags, int method) {
+    if ((flags & ~0x0800) != 0) {
+      throw const BackupException('备份 ZIP 使用了不支持的标志。');
+    }
+    if (method != 0 && method != 8) {
+      throw const BackupException('备份 ZIP 使用了不支持的压缩方法。');
+    }
+  }
+
+  static ({int uncompressed, int compressed, int localOffset, int disk})
+  _resolveCentralZip64({
+    required int rawUncompressed,
+    required int rawCompressed,
+    required int rawLocalOffset,
+    required int rawDisk,
+    required Uint8List extra,
+  }) {
+    final zip64 = _zip64Extra(extra);
+    final needsZip64 =
+        rawUncompressed == 0xffffffff ||
+        rawCompressed == 0xffffffff ||
+        rawLocalOffset == 0xffffffff ||
+        rawDisk == 0xffff;
+    if (!needsZip64) {
+      if (zip64 != null) {
+        throw const BackupException('备份 ZIP64 扩展字段多余。');
+      }
+      return (
+        uncompressed: rawUncompressed,
+        compressed: rawCompressed,
+        localOffset: rawLocalOffset,
+        disk: rawDisk,
+      );
+    }
+    if (zip64 == null) {
+      throw const BackupException('备份 ZIP64 扩展字段缺失。');
+    }
+    var cursor = 0;
+    int read64() {
+      if (cursor + 8 > zip64.lengthInBytes) {
+        throw const BackupException('备份 ZIP64 扩展字段无效。');
+      }
+      final value = zip64.getUint64(cursor, Endian.little);
+      cursor += 8;
+      return value;
+    }
+
+    int read32() {
+      if (cursor + 4 > zip64.lengthInBytes) {
+        throw const BackupException('备份 ZIP64 扩展字段无效。');
+      }
+      final value = zip64.getUint32(cursor, Endian.little);
+      cursor += 4;
+      return value;
+    }
+
+    final uncompressed = rawUncompressed == 0xffffffff
+        ? read64()
+        : rawUncompressed;
+    final compressed = rawCompressed == 0xffffffff ? read64() : rawCompressed;
+    final localOffset = rawLocalOffset == 0xffffffff
+        ? read64()
+        : rawLocalOffset;
+    final disk = rawDisk == 0xffff ? read32() : rawDisk;
+    if (cursor != zip64.lengthInBytes) {
+      throw const BackupException('备份 ZIP64 扩展字段无效。');
+    }
+    return (
+      uncompressed: uncompressed,
+      compressed: compressed,
+      localOffset: localOffset,
+      disk: disk,
+    );
+  }
+
+  static ({int uncompressed, int compressed}) _resolveLocalZip64({
+    required int rawUncompressed,
+    required int rawCompressed,
+    required Uint8List extra,
+  }) {
+    final zip64 = _zip64Extra(extra);
+    final needsZip64 =
+        rawUncompressed == 0xffffffff || rawCompressed == 0xffffffff;
+    if (!needsZip64) {
+      if (zip64 != null) {
+        throw const BackupException('备份 ZIP64 扩展字段多余。');
+      }
+      return (uncompressed: rawUncompressed, compressed: rawCompressed);
+    }
+    if (zip64 == null) {
+      throw const BackupException('备份 ZIP64 扩展字段缺失。');
+    }
+    var cursor = 0;
+    int read64() {
+      if (cursor + 8 > zip64.lengthInBytes) {
+        throw const BackupException('备份 ZIP64 扩展字段无效。');
+      }
+      final value = zip64.getUint64(cursor, Endian.little);
+      cursor += 8;
+      return value;
+    }
+
+    final uncompressed = rawUncompressed == 0xffffffff
+        ? read64()
+        : rawUncompressed;
+    final compressed = rawCompressed == 0xffffffff ? read64() : rawCompressed;
+    if (cursor != zip64.lengthInBytes) {
+      throw const BackupException('备份 ZIP64 扩展字段无效。');
+    }
+    return (uncompressed: uncompressed, compressed: compressed);
+  }
+
+  static ByteData? _zip64Extra(Uint8List extra) {
+    ByteData? zip64;
+    var cursor = 0;
+    final data = ByteData.sublistView(extra);
+    while (cursor < extra.length) {
+      if (cursor + 4 > extra.length) {
+        throw const BackupException('备份 ZIP 扩展字段无效。');
+      }
+      final id = data.getUint16(cursor, Endian.little);
+      final length = data.getUint16(cursor + 2, Endian.little);
+      cursor += 4;
+      if (cursor + length > extra.length) {
+        throw const BackupException('备份 ZIP 扩展字段无效。');
+      }
+      if (id != 1 || zip64 != null) {
+        throw const BackupException('备份 ZIP 扩展字段不受支持。');
+      }
+      zip64 = ByteData.sublistView(extra, cursor, cursor + length);
+      cursor += length;
+    }
+    return zip64;
+  }
+
+  static bool _equalBytes(Uint8List left, Uint8List right) {
+    if (left.length != right.length) return false;
+    for (var index = 0; index < left.length; index += 1) {
+      if (left[index] != right[index]) return false;
+    }
+    return true;
   }
 
   void _validateArchiveHeaders(List<ArchiveFile> entries) {
@@ -840,24 +1217,49 @@ class LocalBackupService implements BackupService {
     }
     for (final entry in expected.values) {
       final file = File(p.joinAll([directory.path, ...entry.path.split('/')]));
-      if (await FileSystemEntity.type(file.path, followLinks: false) !=
-          FileSystemEntityType.file) {
-        throw BackupException('备份文件缺失：${entry.path}');
-      }
-      final size = await file.length();
-      if (size != entry.size) {
-        throw BackupException('备份文件大小不符：${entry.path}');
-      }
-      final digest = await sha256.bind(file.openRead()).first;
-      if (digest.toString() != entry.sha256) {
-        throw BackupException('备份文件校验失败：${entry.path}');
-      }
+      await _validateFileEntry(file, entry);
     }
     if (checkDatabase) {
       await _verifyDatabaseIntegrity(
         p.joinAll([directory.path, ...databaseArchivePath.split('/')]),
         expectedMediaPaths: manifest.media.map((entry) => entry.path).toSet(),
       );
+    }
+  }
+
+  Future<void> _validateInstalledReplacement(
+    String databasePath, {
+    required Directory supportRoot,
+    required BackupManifestV1 manifest,
+  }) async {
+    await _validateFileEntry(File(databasePath), manifest.database);
+    for (final entry in manifest.media) {
+      await _validateFileEntry(
+        File(p.joinAll([supportRoot.path, ...entry.path.split('/')])),
+        entry,
+      );
+    }
+    await _verifyDatabaseIntegrity(
+      databasePath,
+      expectedMediaPaths: manifest.media.map((entry) => entry.path).toSet(),
+    );
+  }
+
+  static Future<void> _validateFileEntry(
+    File file,
+    BackupFileEntry entry,
+  ) async {
+    if (await FileSystemEntity.type(file.path, followLinks: false) !=
+        FileSystemEntityType.file) {
+      throw BackupException('备份文件缺失：${entry.path}');
+    }
+    final size = await file.length();
+    if (size != entry.size) {
+      throw BackupException('备份文件大小不符：${entry.path}');
+    }
+    final digest = await sha256.bind(file.openRead()).first;
+    if (digest.toString() != entry.sha256) {
+      throw BackupException('备份文件校验失败：${entry.path}');
     }
   }
 
@@ -1318,13 +1720,45 @@ class LocalBackupService implements BackupService {
 class _InspectionBinding {
   const _InspectionBinding({
     required this.temporaryDirectory,
+    required this.archiveDirectory,
+    required this.archivePath,
+    required this.archiveSize,
+    required this.archiveSha256,
     required this.manifest,
     required this.manifestSha256,
   });
 
   final String temporaryDirectory;
+  final String archiveDirectory;
+  final String archivePath;
+  final int archiveSize;
+  final String archiveSha256;
   final BackupManifestV1 manifest;
   final String manifestSha256;
+}
+
+class _ZipCentralEntry {
+  const _ZipCentralEntry({
+    required this.name,
+    required this.flags,
+    required this.method,
+    required this.crc32,
+    required this.compressedSize,
+    required this.uncompressedSize,
+    required this.localOffset,
+    required this.zip64Compressed,
+    required this.zip64Uncompressed,
+  });
+
+  final Uint8List name;
+  final int flags;
+  final int method;
+  final int crc32;
+  final int compressedSize;
+  final int uncompressedSize;
+  final int localOffset;
+  final bool zip64Compressed;
+  final bool zip64Uncompressed;
 }
 
 class _RestoreState {

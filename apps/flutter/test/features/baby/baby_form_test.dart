@@ -40,6 +40,27 @@ void main() {
     expect(saved, const BabyDraft(name: '安安', birthDate: '2025-06-15'));
   });
 
+  testWidgets('selects an optional sex when creating a profile', (
+    tester,
+  ) async {
+    BabyDraft? saved;
+    await pumpForm(tester, onSave: (draft) async => saved = draft);
+
+    await tester.enterText(find.byKey(const Key('baby-name')), '安安');
+    await tester.enterText(find.byKey(const Key('birth-date')), '2025-06-15');
+    await tester.tap(find.byKey(const Key('baby-sex')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('女').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('保存'));
+    await tester.pump();
+
+    expect(
+      saved,
+      const BabyDraft(name: '安安', birthDate: '2025-06-15', sex: '女'),
+    );
+  });
+
   testWidgets('shows an error below the name when it is empty', (tester) async {
     await pumpForm(tester, onSave: (_) async {});
 
@@ -85,6 +106,70 @@ void main() {
           .text,
       '2025-06-15',
     );
+  });
+
+  testWidgets('prefills and modifies sex when editing a baby', (tester) async {
+    BabyDraft? saved;
+    final baby = Baby(
+      id: 'baby-1',
+      name: '乐乐',
+      birthDate: '2025-06-15',
+      sex: '女',
+      createdAt: DateTime.utc(2025, 6, 15),
+      updatedAt: DateTime.utc(2025, 6, 15),
+    );
+    await pumpForm(
+      tester,
+      initialValue: baby,
+      onSave: (draft) async => saved = draft,
+    );
+
+    expect(
+      tester
+          .widget<DropdownButton<String>>(
+            find.descendant(
+              of: find.byKey(const Key('baby-sex')),
+              matching: find.byType(DropdownButton<String>),
+            ),
+          )
+          .value,
+      '女',
+    );
+    await tester.tap(find.byKey(const Key('baby-sex')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('男').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('保存'));
+    await tester.pump();
+
+    expect(saved?.sex, '男');
+  });
+
+  testWidgets('clears an existing optional sex', (tester) async {
+    BabyDraft? saved;
+    final baby = Baby(
+      id: 'baby-1',
+      name: '乐乐',
+      birthDate: '2025-06-15',
+      sex: '女',
+      createdAt: DateTime.utc(2025, 6, 15),
+      updatedAt: DateTime.utc(2025, 6, 15),
+    );
+    await pumpForm(
+      tester,
+      initialValue: baby,
+      onSave: (draft) async => saved = draft,
+    );
+
+    await tester.tap(find.byKey(const Key('baby-sex')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('不填写').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('保存'));
+    await tester.pump();
+
+    expect(saved, isNotNull);
+    expect(saved!.sex, isNull);
   });
 
   testWidgets('retains entered values when saving fails', (tester) async {

@@ -23,6 +23,7 @@ class RecordEditorPage extends StatefulWidget {
     this.now,
     this.onSaved,
     this.mediaPickerAdapter,
+    this.mediaService,
   }) {
     final suppliedController = controller;
     if (suppliedController == null && repository == null) {
@@ -50,6 +51,7 @@ class RecordEditorPage extends StatefulWidget {
   final RecordEditorController? controller;
   final DateTime Function()? now;
   final MediaPickerAdapter? mediaPickerAdapter;
+  final MediaService? mediaService;
 
   /// When supplied, this callback owns post-save navigation.
   final Future<void> Function()? onSaved;
@@ -99,7 +101,8 @@ class _RecordEditorPageState extends State<RecordEditorPage> {
     if (oldWidget.type == widget.type &&
         oldWidget.recordId == widget.recordId &&
         oldWidget.repository == widget.repository &&
-        oldWidget.controller == widget.controller) {
+        oldWidget.controller == widget.controller &&
+        oldWidget.mediaService == widget.mediaService) {
       return;
     }
     _loadGeneration += 1;
@@ -119,6 +122,7 @@ class _RecordEditorPageState extends State<RecordEditorPage> {
         type: widget.type,
         recordId: widget.recordId,
         now: widget.now,
+        mediaService: widget.mediaService,
       );
 
   Future<void> _loadExisting() async {

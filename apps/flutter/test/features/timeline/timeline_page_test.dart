@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:baby_growth_timeline/data/repositories/record_repository.dart';
 import 'package:baby_growth_timeline/domain/models/attachment.dart';
@@ -10,8 +11,23 @@ import 'package:baby_growth_timeline/features/timeline/presentation/timeline_pag
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import '../../support/media_fixture.dart';
+
 void main() {
   final now = DateTime(2026, 8, 1, 12);
+  late Directory mediaDirectory;
+
+  setUp(() {
+    mediaDirectory = Directory.systemTemp.createTempSync(
+      'timeline-card-media-',
+    );
+  });
+
+  tearDown(() {
+    if (mediaDirectory.existsSync()) {
+      mediaDirectory.deleteSync(recursive: true);
+    }
+  });
 
   TimelineRecord record({
     required String id,
@@ -266,6 +282,148 @@ void main() {
 
   test('uses the preceding local calendar date for yesterday', () {
     expect(timelineDayLabel('2024-03-10', DateTime(2024, 3, 11, 12)), '昨天');
+  });
+
+  testWidgets('moment card renders its first existing image file', (
+    tester,
+  ) async {
+    final image = writeValidPng(mediaDirectory, 'moment.png');
+    final moment = record(
+      id: 'image-moment',
+      type: RecordType.moment,
+      occurredAt: now,
+      attachments: [
+        Attachment(
+          id: 'image',
+          recordId: 'image-moment',
+          mediaType: MediaType.image,
+          filePath: image.path,
+          createdAt: now.toUtc(),
+        ),
+      ],
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: TimelineCard(record: moment, onTap: () {}),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.byType(Image), findsOneWidget);
+    expect(find.byIcon(Icons.photo_camera_outlined), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('moment card renders a video thumbnail with play affordance', (
+    tester,
+  ) async {
+    final video = File('${mediaDirectory.path}/moment.mp4');
+    video.writeAsBytesSync(const [0]);
+    final thumbnail = writeValidPng(mediaDirectory, 'video-thumb.png');
+    final moment = record(
+      id: 'video-moment',
+      type: RecordType.moment,
+      occurredAt: now,
+      attachments: [
+        Attachment(
+          id: 'video',
+          recordId: 'video-moment',
+          mediaType: MediaType.video,
+          filePath: video.path,
+          thumbnailPath: thumbnail.path,
+          createdAt: now.toUtc(),
+        ),
+      ],
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: TimelineCard(record: moment, onTap: () {}),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.byType(Image), findsOneWidget);
+    expect(find.byIcon(Icons.play_arrow), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('moment card reports a missing media file', (tester) async {
+    TimelineRecord momentWithPath(String path) => record(
+      id: 'unavailable-moment',
+      type: RecordType.moment,
+      occurredAt: now,
+      attachments: [
+        Attachment(
+          id: 'image',
+          recordId: 'unavailable-moment',
+          mediaType: MediaType.image,
+          filePath: path,
+          createdAt: now.toUtc(),
+        ),
+      ],
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: TimelineCard(
+          record: momentWithPath('${mediaDirectory.path}/missing.png'),
+          onTap: () {},
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('媒体文件不可用'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('moment card reports an image decode failure', (tester) async {
+    final corrupt = File('${mediaDirectory.path}/corrupt.png');
+    corrupt.writeAsStringSync('not an image');
+    final moment = record(
+      id: 'corrupt-moment',
+      type: RecordType.moment,
+      occurredAt: now,
+      attachments: [
+        Attachment(
+          id: 'image',
+          recordId: 'corrupt-moment',
+          mediaType: MediaType.image,
+          filePath: corrupt.path,
+          createdAt: now.toUtc(),
+        ),
+      ],
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: TimelineCard(record: moment, onTap: () {}),
+      ),
+    );
+    await pumpUntilVisible(tester, find.text('媒体文件不可用'));
+
+    expect(find.text('媒体文件不可用'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('moment card keeps its placeholder when there is no attachment', (
+    tester,
+  ) async {
+    final moment = record(
+      id: 'empty-moment',
+      type: RecordType.moment,
+      occurredAt: now,
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: TimelineCard(record: moment, onTap: () {}),
+      ),
+    );
+
+    expect(find.byIcon(Icons.photo_camera_outlined), findsOneWidget);
+    expect(find.text('媒体文件不可用'), findsNothing);
   });
 
   testWidgets('matches the stable mixed timeline layout', (tester) async {

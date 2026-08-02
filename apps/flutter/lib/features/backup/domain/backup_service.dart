@@ -48,3 +48,31 @@ class BackupRollbackException extends BackupException {
   final Object originalError;
   final Object rollbackError;
 }
+
+class BackupReopenException extends BackupException {
+  factory BackupReopenException({
+    required String recoveryPath,
+    required Object? operationError,
+    required Object reopenError,
+    required Future<void> Function() retryReopen,
+  }) => BackupReopenException._(
+    recoveryPath: recoveryPath,
+    operationError: operationError,
+    reopenError: reopenError,
+    retryReopen: retryReopen,
+  );
+
+  BackupReopenException._({
+    required this.recoveryPath,
+    required this.operationError,
+    required this.reopenError,
+    required this._retryReopen,
+  }) : super('数据库重新打开失败，恢复数据保留在 $recoveryPath', reopenError);
+
+  final String recoveryPath;
+  final Object? operationError;
+  final Object reopenError;
+  final Future<void> Function() _retryReopen;
+
+  Future<void> retryReopen() => _retryReopen();
+}

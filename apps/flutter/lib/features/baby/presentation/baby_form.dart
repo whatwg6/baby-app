@@ -43,6 +43,7 @@ class BabyForm extends StatefulWidget {
 class _BabyFormState extends State<BabyForm> {
   late final TextEditingController _nameController;
   late final TextEditingController _birthDateController;
+  String? _sex;
   String? _nameError;
   String? _birthDateError;
   String? _saveError;
@@ -60,6 +61,7 @@ class _BabyFormState extends State<BabyForm> {
     _birthDateController = TextEditingController(
       text: widget.initialValue?.birthDate,
     );
+    _sex = widget.initialValue?.sex;
     _mediaService = widget.mediaService ?? LocalMediaService();
   }
 
@@ -77,7 +79,7 @@ class _BabyFormState extends State<BabyForm> {
     final draft = BabyDraft(
       name: _nameController.text,
       birthDate: _birthDateController.text,
-      sex: widget.initialValue?.sex,
+      sex: _sex,
       avatarPath: widget.initialValue?.avatarPath,
     );
     setState(() {
@@ -249,6 +251,22 @@ class _BabyFormState extends State<BabyForm> {
               icon: const Icon(Icons.calendar_today_outlined),
             ),
           ),
+        ),
+        const SizedBox(height: 16),
+        DropdownButtonFormField<String>(
+          key: const Key('baby-sex'),
+          initialValue: _sex ?? '',
+          decoration: const InputDecoration(labelText: '性别（可选）'),
+          items: const [
+            DropdownMenuItem(value: '', child: Text('不填写')),
+            DropdownMenuItem(value: '女', child: Text('女')),
+            DropdownMenuItem(value: '男', child: Text('男')),
+          ],
+          onChanged: disabled
+              ? null
+              : (value) => setState(() {
+                  _sex = value == null || value.isEmpty ? null : value;
+                }),
         ),
         const SizedBox(height: 16),
         if (_pickedAvatar case final picked?) ...[

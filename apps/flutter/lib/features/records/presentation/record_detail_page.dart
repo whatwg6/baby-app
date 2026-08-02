@@ -3,6 +3,7 @@ import 'package:go_router/go_router.dart';
 
 import '../../../data/repositories/record_repository.dart';
 import '../../../domain/models/attachment.dart';
+import '../../../domain/destructive_operation_gate.dart';
 import '../../../domain/models/timeline_record.dart';
 import '../../media/domain/media_service.dart';
 import '../../media/presentation/media_preview.dart';
@@ -16,6 +17,7 @@ class RecordDetailPage extends StatefulWidget {
     required this.recordId,
     this.repository,
     this.mediaService,
+    this.destructiveOperationGate,
     this.queueOrphanCleanup,
     this.timelineController,
   });
@@ -23,6 +25,7 @@ class RecordDetailPage extends StatefulWidget {
   final String recordId;
   final RecordRepository? repository;
   final MediaService? mediaService;
+  final DestructiveOperationGate? destructiveOperationGate;
   final OrphanCleanupQueue? queueOrphanCleanup;
   final TimelineController? timelineController;
 
@@ -122,9 +125,11 @@ class _RecordDetailPageState extends State<RecordDetailPage> {
   Widget _deleteButton(TimelineRecord record) {
     final repository = widget.repository;
     final mediaService = widget.mediaService;
+    final destructiveOperationGate = widget.destructiveOperationGate;
     final queueOrphanCleanup = widget.queueOrphanCleanup;
     if (repository == null ||
         mediaService == null ||
+        destructiveOperationGate == null ||
         queueOrphanCleanup == null) {
       return OutlinedButton.icon(
         onPressed: null,
@@ -136,6 +141,7 @@ class _RecordDetailPageState extends State<RecordDetailPage> {
       recordId: record.id,
       repository: repository,
       mediaService: mediaService,
+      destructiveOperationGate: destructiveOperationGate,
       queueOrphanCleanup: queueOrphanCleanup,
       onDeleted: () async {
         await widget.timelineController?.reload();

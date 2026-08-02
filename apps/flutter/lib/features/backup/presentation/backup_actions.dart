@@ -2,6 +2,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../../../data/database/app_database.dart';
+import '../../../domain/destructive_operation_gate.dart';
 import '../../media/domain/media_service.dart';
 import '../domain/backup_service.dart';
 
@@ -25,8 +26,9 @@ class ClearAllDataCleanupException implements Exception {
 Future<void> clearAllData({
   required AppDatabase database,
   required MediaService mediaService,
+  required DestructiveOperationGate destructiveOperationGate,
   required Future<void> Function(Set<String> paths) queueOrphanCleanup,
-}) async {
+}) => destructiveOperationGate.run(() async {
   final paths = await database.transaction((transaction) async {
     final referenced = <String>{};
     final babies = await transaction.query('baby', columns: ['avatar_path']);
@@ -64,7 +66,7 @@ Future<void> clearAllData({
       );
     }
   }
-}
+});
 
 class BackupActions extends StatefulWidget {
   const BackupActions({

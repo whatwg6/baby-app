@@ -2,6 +2,7 @@ import 'package:baby_growth_timeline/features/baby/application/baby_controller.d
 import 'package:baby_growth_timeline/features/baby/presentation/baby_page.dart';
 import 'package:baby_growth_timeline/features/baby/presentation/baby_setup_page.dart';
 import 'package:baby_growth_timeline/data/repositories/record_repository.dart';
+import 'package:baby_growth_timeline/domain/destructive_operation_gate.dart';
 import 'package:baby_growth_timeline/features/records/presentation/add_record_page.dart';
 import 'package:baby_growth_timeline/features/records/presentation/record_detail_page.dart';
 import 'package:baby_growth_timeline/features/records/presentation/record_editor_page.dart';
@@ -11,24 +12,35 @@ import 'package:baby_growth_timeline/features/timeline/presentation/timeline_pag
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
+import 'providers.dart';
+
 GoRouter createRouter({
   bool hasBaby = false,
   BabyController? babyController,
   RecordRepository? recordRepository,
   TimelineController? timelineController,
+  AppServices? services,
+  Future<void> Function()? clearAllData,
+  DestructiveOperationGate? destructiveOperationGate,
 }) {
+  final resolvedBabyController =
+      babyController ??
+      (services == null ? null : BabyController(services.babies));
+  final resolvedRecordRepository = recordRepository ?? services?.records;
   final resolvedTimelineController =
       timelineController ??
-      (recordRepository == null ? null : TimelineController(recordRepository));
+      (resolvedRecordRepository == null
+          ? null
+          : TimelineController(resolvedRecordRepository));
   final addBranchReset = _AddBranchResetSignal();
   return GoRouter(
     initialLocation: '/timeline',
     redirect: (context, state) async {
-      if (babyController == null) {
+      if (resolvedBabyController == null) {
         return null;
       }
-      await babyController.load();
-      final hasStoredBaby = babyController.baby != null;
+      await resolvedBabyController.load();
+      final hasStoredBaby = resolvedBabyController.baby != null;
       final isSetupRoute = state.matchedLocation == '/baby/setup';
       if (!hasStoredBaby && !isSetupRoute) {
         return '/baby/setup';
@@ -44,29 +56,33 @@ GoRouter createRouter({
         path: '/records/:id',
         builder: (context, state) => RecordDetailPage(
           recordId: state.pathParameters['id']!,
-          repository: recordRepository,
+          repository: resolvedRecordRepository,
+          mediaService: services?.media,
+          destructiveOperationGate: destructiveOperationGate,
+          queueOrphanCleanup: services == null ? null : (_) async {},
           timelineController: resolvedTimelineController,
         ),
       ),
       GoRoute(
         path: '/records/:id/edit',
         builder: (context, state) {
-          if (recordRepository == null) {
+          if (resolvedRecordRepository == null) {
             return const _ProfileUnavailablePage();
           }
           final type = _recordType(state.uri.queryParameters['type']);
           return RecordEditorPage(
             type: type ?? RecordType.moment,
             recordId: state.pathParameters['id']!,
-            repository: recordRepository,
+            repository: resolvedRecordRepository,
+            mediaService: services?.media,
           );
         },
       ),
       GoRoute(
         path: '/baby/setup',
-        builder: (context, state) => babyController == null
+        builder: (context, state) => resolvedBabyController == null
             ? const _ProfileUnavailablePage()
-            : BabySetupPage(controller: babyController),
+            : BabySetupPage(controller: resolvedBabyController),
       ),
       StatefulShellRoute.indexedStack(
         builder: (context, state, navigationShell) {
@@ -81,9 +97,9 @@ GoRouter createRouter({
               GoRoute(
                 path: '/timeline',
                 builder: (context, state) => TimelinePage(
-                  hasBaby: hasBaby || babyController?.baby != null,
+                  hasBaby: hasBaby || resolvedBabyController?.baby != null,
                   controller: resolvedTimelineController,
-                  baby: babyController?.baby,
+                  babyController: resolvedBabyController,
                 ),
               ),
             ],
@@ -98,11 +114,12 @@ GoRouter createRouter({
                 path: '/add/:type',
                 builder: (context, state) {
                   final type = _recordType(state.pathParameters['type']);
-                  return type == null || recordRepository == null
+                  return type == null || resolvedRecordRepository == null
                       ? const _ProfileUnavailablePage()
                       : RecordEditorPage(
                           type: type,
-                          repository: recordRepository,
+                          repository: resolvedRecordRepository,
+                          mediaService: services?.media,
                           onSaved: () async {
                             final router = GoRouter.of(context);
                             addBranchReset.arm();
@@ -118,8 +135,28 @@ GoRouter createRouter({
             routes: [
               GoRoute(
                 path: '/baby',
-                builder: (context, state) =>
-                    BabyPage(controller: babyController),
+                builder: (context, state) => BabyPage(
+                  controller: resolvedBabyController,
+                  backupService: services?.backup,
+                  onBackupRestored: () async {
+                    await Future.wait([
+                      resolvedBabyController?.reload() ?? Future<void>.value(),
+                      resolvedTimelineController?.reload() ??
+                          Future<void>.value(),
+                    ]);
+                  },
+                  onClearAllData: clearAllData == null
+                      ? null
+                      : () async {
+                          await clearAllData();
+                          await Future.wait([
+                            resolvedBabyController?.reload() ??
+                                Future<void>.value(),
+                            resolvedTimelineController?.reload() ??
+                                Future<void>.value(),
+                          ]);
+                        },
+                ),
               ),
             ],
           ),

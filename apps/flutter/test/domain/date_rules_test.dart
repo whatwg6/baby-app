@@ -20,9 +20,9 @@ void main() {
     'groups newest local day first and keeps UTC-descending order in a day',
     () {
       final records = [
-        _record('old', DateTime.utc(2026, 7, 31, 8)),
-        _record('newer', DateTime.utc(2026, 8, 1, 3)),
-        _record('newest', DateTime.utc(2026, 8, 1, 4)),
+        _record('old', DateTime(2026, 7, 31, 8).toUtc()),
+        _record('newer', DateTime(2026, 8, 1, 3).toUtc()),
+        _record('newest', DateTime(2026, 8, 1, 4).toUtc()),
       ];
 
       final groups = groupRecordsByLocalDay(records);
@@ -35,16 +35,10 @@ void main() {
     },
   );
 
-  test('uses local time when deriving a day key', () {
-    final utc = DateTime.utc(2026, 8, 1, 16, 30);
+  test('derives a literal day key from a known local instant', () {
+    final utcStorageValue = DateTime(2026, 8, 1, 0, 30).toUtc();
 
-    final expected = utc.toLocal();
-    expect(
-      localDayKey(utc),
-      '${expected.year.toString().padLeft(4, '0')}-'
-      '${expected.month.toString().padLeft(2, '0')}-'
-      '${expected.day.toString().padLeft(2, '0')}',
-    );
+    expect(localDayKey(utcStorageValue), '2026-08-01');
   });
 }
 

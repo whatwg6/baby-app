@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -6,6 +7,7 @@ import 'package:archive/archive.dart';
 import 'package:baby_growth_timeline/data/database/app_database.dart';
 import 'package:baby_growth_timeline/data/database/database_lifecycle.dart';
 import 'package:baby_growth_timeline/data/database/migrations.dart';
+import 'package:baby_growth_timeline/domain/destructive_operation_gate.dart';
 import 'package:baby_growth_timeline/features/backup/data/local_backup_service.dart';
 import 'package:baby_growth_timeline/features/backup/domain/backup_manifest.dart';
 import 'package:baby_growth_timeline/features/backup/presentation/backup_actions.dart';
@@ -25,6 +27,7 @@ void main() {
   late AppDatabase database;
   late List<String> sharedPaths;
   late int nextId;
+  late DestructiveOperationGate destructiveOperationGate;
 
   String id() => 'id-${nextId++}';
 
@@ -36,8 +39,11 @@ void main() {
     BackupPathRenamer? renamePath,
     BackupDirectoryDeleter? deleteDirectory,
     DateTime Function()? now,
+    DestructiveOperationGate? gate,
+    BackupArchiveCopyObserver? onArchiveCopyChunk,
   }) async => LocalBackupService(
     databaseLifecycle: lifecycle ?? database,
+    destructiveOperationGate: gate ?? destructiveOperationGate,
     databaseFactory: databaseFactoryFfi,
     applicationSupportDirectory: () async => support,
     inspectionDirectory: () async => inspections,
@@ -52,6 +58,7 @@ void main() {
     onRestoreStep: onRestoreStep,
     renamePath: renamePath,
     deleteDirectory: deleteDirectory,
+    onArchiveCopyChunk: onArchiveCopyChunk,
   );
 
   setUp(() async {
@@ -66,6 +73,7 @@ void main() {
     );
     sharedPaths = [];
     nextId = 0;
+    destructiveOperationGate = SerialDestructiveOperationGate();
   });
 
   tearDown(() async {
@@ -183,6 +191,68 @@ void main() {
       );
 
       expect(sharedPaths, isEmpty);
+    },
+  );
+
+  test(
+    'export enforces entry, total, and manifest limits before encoding',
+    () async {
+      final media = await _writeSupportFile(
+        support,
+        'media/originals/export-limits.jpg',
+        [1, 2, 3],
+      );
+      await _seedDatabase(database, babyName: '宝宝', originalPath: media.path);
+      final limits = [
+        const BackupArchiveLimits(maxEntries: 2),
+        const BackupArchiveLimits(maxTotalBytes: 1),
+        const BackupArchiveLimits(maxManifestBytes: 1),
+      ];
+
+      for (final configured in limits) {
+        final service = await createService(limits: configured);
+        await expectLater(
+          service.exportBackup(),
+          throwsA(isA<BackupException>()),
+        );
+      }
+
+      expect(sharedPaths, isEmpty);
+      final exports = Directory(p.join(support.path, 'backup-exports'));
+      expect(
+        await exports.exists()
+            ? await exports.list(followLinks: false).toList()
+            : const <FileSystemEntity>[],
+        isEmpty,
+      );
+    },
+  );
+
+  test(
+    'a constrained exported archive passes inspection with the same limits',
+    () async {
+      final media = await _writeSupportFile(
+        support,
+        'media/originals/export-round-trip.jpg',
+        [4, 5, 6],
+      );
+      await _seedDatabase(database, babyName: '宝宝', originalPath: media.path);
+      const configured = BackupArchiveLimits(
+        maxArchiveBytes: 2 * 1024 * 1024,
+        maxEntryBytes: 1024 * 1024,
+        maxTotalBytes: 2 * 1024 * 1024,
+        maxEntries: 3,
+        maxManifestBytes: 16 * 1024,
+      );
+      final service = await createService(limits: configured);
+
+      final archive = await service.exportBackup();
+      final inspected = await service.inspect(archive);
+
+      expect(
+        inspected.manifest.media.single.path,
+        endsWith('export-round-trip.jpg'),
+      );
     },
   );
 
@@ -499,6 +569,101 @@ void main() {
     );
 
     test(
+      'central and local ZIP metadata must be structurally unambiguous',
+      () async {
+        final service = await createService();
+        final mutations = <String, void Function(Uint8List, int, int)>{
+          'local-name': (bytes, central, local) {
+            bytes[local + 30] ^= 1;
+          },
+          'central-crc': (bytes, central, local) {
+            final data = ByteData.sublistView(bytes);
+            data.setUint32(
+              central + 16,
+              data.getUint32(central + 16, Endian.little) ^ 1,
+              Endian.little,
+            );
+          },
+          'local-crc': (bytes, central, local) {
+            final data = ByteData.sublistView(bytes);
+            data.setUint32(
+              local + 14,
+              data.getUint32(local + 14, Endian.little) ^ 1,
+              Endian.little,
+            );
+          },
+          'central-encryption': (bytes, central, local) {
+            final data = ByteData.sublistView(bytes);
+            data.setUint16(
+              central + 8,
+              data.getUint16(central + 8, Endian.little) | 1,
+              Endian.little,
+            );
+          },
+          'local-size': (bytes, central, local) {
+            final data = ByteData.sublistView(bytes);
+            data.setUint32(
+              local + 18,
+              data.getUint32(local + 18, Endian.little) + 1,
+              Endian.little,
+            );
+          },
+          'descriptor': (bytes, central, local) {
+            final data = ByteData.sublistView(bytes);
+            data.setUint16(
+              central + 8,
+              data.getUint16(central + 8, Endian.little) | 0x08,
+              Endian.little,
+            );
+            data.setUint16(
+              local + 6,
+              data.getUint16(local + 6, Endian.little) | 0x08,
+              Endian.little,
+            );
+          },
+          'unsupported-method': (bytes, central, local) {
+            final data = ByteData.sublistView(bytes);
+            data.setUint16(central + 10, 12, Endian.little);
+            data.setUint16(local + 8, 12, Endian.little);
+          },
+          'missing-zip64-extra': (bytes, central, local) {
+            final data = ByteData.sublistView(bytes);
+            data.setUint32(central + 24, 0xffffffff, Endian.little);
+            data.setUint32(local + 22, 0xffffffff, Endian.little);
+          },
+          'local-offset-out-of-bounds': (bytes, central, local) {
+            ByteData.sublistView(
+              bytes,
+            ).setUint32(central + 42, central, Endian.little);
+          },
+          'overlapping-local-ranges': (bytes, central, local) {
+            final data = ByteData.sublistView(bytes);
+            final nameLength = data.getUint16(central + 28, Endian.little);
+            final extraLength = data.getUint16(central + 30, Endian.little);
+            final commentLength = data.getUint16(central + 32, Endian.little);
+            final secondCentral =
+                central + 46 + nameLength + extraLength + commentLength;
+            data.setUint32(secondCentral + 42, local, Endian.little);
+          },
+        };
+
+        for (final mutation in mutations.entries) {
+          final archive = await _createMutatedArchive(
+            root,
+            databaseFactoryFfi,
+            mutation.key,
+            mutation.value,
+          );
+          await expectLater(
+            service.inspect(archive),
+            throwsA(isA<BackupException>()),
+            reason: mutation.key,
+          );
+        }
+      },
+    );
+
+    test(
       'corrupt SQLite and newer user_version are rejected independently',
       () async {
         final service = await createService();
@@ -550,6 +715,67 @@ void main() {
       },
     );
   });
+
+  test(
+    'inspect reads a private snapshot when the source path is replaced',
+    () async {
+      final archive = await _createArchiveFixture(root, databaseFactoryFfi);
+      final movedSource = '$archive.original';
+      var replaced = false;
+      final service = await createService(
+        onArchiveCopyChunk: (_) async {
+          if (replaced) return;
+          replaced = true;
+          await File(archive).rename(movedSource);
+          await File(archive).writeAsBytes(utf8.encode('replacement'));
+        },
+      );
+
+      final inspected = await service.inspect(archive);
+
+      expect(replaced, isTrue);
+      expect(inspected.manifest.format, 'baby-growth-backup');
+      expect(await File(archive).readAsString(), 'replacement');
+    },
+  );
+
+  test(
+    'inspect caps a source archive that grows during snapshot copy',
+    () async {
+      final archive = await _createArchiveFixture(root, databaseFactoryFfi);
+      final initialLength = await File(archive).length();
+      var grew = false;
+      final service = await createService(
+        limits: BackupArchiveLimits(maxArchiveBytes: initialLength + 32),
+        onArchiveCopyChunk: (_) async {
+          if (grew) return;
+          grew = true;
+          await File(
+            archive,
+          ).writeAsBytes(List<int>.filled(1024, 7), mode: FileMode.append);
+        },
+      );
+
+      await expectLater(
+        service.inspect(archive),
+        throwsA(
+          isA<BackupException>().having(
+            (error) => error.message,
+            'message',
+            '备份文件超过大小限制。',
+          ),
+        ),
+      );
+
+      expect(grew, isTrue);
+      expect(
+        await inspections.exists()
+            ? await inspections.list(followLinks: false).toList()
+            : const <FileSystemEntity>[],
+        isEmpty,
+      );
+    },
+  );
 
   test(
     'restore reopens migrated data and removes inspection and rollback data',
@@ -617,6 +843,7 @@ void main() {
       );
       final sourceService = LocalBackupService(
         databaseLifecycle: sourceDatabase,
+        destructiveOperationGate: destructiveOperationGate,
         databaseFactory: databaseFactoryFfi,
         applicationSupportDirectory: () async => sourceSupport,
         inspectionDirectory: () async => inspections,
@@ -721,6 +948,105 @@ void main() {
     },
   );
 
+  test(
+    'restore revalidates media after final validation and installation',
+    () async {
+      final media = await _writeSupportFile(
+        support,
+        'media/originals/installed-revalidation.jpg',
+        [1],
+      );
+      await _seedDatabase(database, babyName: '新数据', originalPath: media.path);
+      final exporter = await createService();
+      final archive = await exporter.exportBackup();
+      await media.writeAsBytes([9], flush: true);
+      await database.write(
+        (db) => db.update(
+          'baby',
+          {'name': '旧数据'},
+          where: 'id = ?',
+          whereArgs: ['baby-1'],
+        ),
+      );
+      late String inspectionPath;
+      final restorer = await createService(
+        onRestoreStep: (step) async {
+          if (step == BackupRestoreStep.beforeCurrentDatabaseMove) {
+            await File(
+              p.join(
+                inspectionPath,
+                'media',
+                'originals',
+                'installed-revalidation.jpg',
+              ),
+            ).writeAsBytes([2], flush: true);
+          }
+        },
+      );
+      final inspected = await restorer.inspect(archive);
+      inspectionPath = inspected.temporaryDirectory;
+
+      await expectLater(
+        restorer.restore(inspected),
+        throwsA(isA<BackupException>()),
+      );
+
+      expect(
+        (await database.read((db) => db.query('baby'))).single['name'],
+        '旧数据',
+      );
+      expect(await media.readAsBytes(), [9]);
+    },
+  );
+
+  test('restore rejects a valid database substituted during rename', () async {
+    final media = await _writeSupportFile(
+      support,
+      'media/originals/database-substitution.jpg',
+      [1],
+    );
+    await _seedDatabase(database, babyName: '备份数据', originalPath: media.path);
+    final exporter = await createService();
+    final archive = await exporter.exportBackup();
+    await media.writeAsBytes([9], flush: true);
+    await database.write(
+      (db) => db.update(
+        'baby',
+        {'name': '当前数据'},
+        where: 'id = ?',
+        whereArgs: ['baby-1'],
+      ),
+    );
+    final substitutePath = p.join(root.path, 'substitute.sqlite');
+    final substitute = await AppDatabase.open(
+      path: substitutePath,
+      databaseFactory: databaseFactoryFfi,
+    );
+    await _seedDatabase(substitute, babyName: '替换数据', originalPath: media.path);
+    await substitute.close();
+    final restorer = await createService(
+      renamePath: (source, destination) async {
+        await _renameEntity(source, destination);
+        if (source.contains('baby-growth-inspection-') &&
+            destination == databasePath) {
+          await File(substitutePath).copy(destination);
+        }
+      },
+    );
+    final inspected = await restorer.inspect(archive);
+
+    await expectLater(
+      restorer.restore(inspected),
+      throwsA(isA<BackupException>()),
+    );
+
+    expect(
+      (await database.read((db) => db.query('baby'))).single['name'],
+      '当前数据',
+    );
+    expect(await media.readAsBytes(), [9]);
+  });
+
   test('every injected swap failure restores readable old data', () async {
     const steps = [
       BackupRestoreStep.beforeCurrentDatabaseMove,
@@ -817,6 +1143,59 @@ void main() {
   );
 
   test(
+    'callback and reopen failures preserve recovery until retry succeeds',
+    () async {
+      await _seedDatabase(database, babyName: '备份数据');
+      final exporter = await createService();
+      final archive = await exporter.exportBackup();
+      await database.write(
+        (db) => db.update(
+          'baby',
+          {'name': '当前数据'},
+          where: 'id = ?',
+          whereArgs: ['baby-1'],
+        ),
+      );
+      final failingLifecycle = _ReopenFailureLifecycle(
+        database,
+        explicitFailures: 1,
+      );
+      final restorer = await createService(
+        lifecycle: failingLifecycle,
+        onRestoreStep: (step) async {
+          if (step == BackupRestoreStep.afterReplacementDatabaseMove) {
+            throw StateError('install callback failed');
+          }
+        },
+      );
+      final inspected = await restorer.inspect(archive);
+
+      BackupReopenException? failure;
+      try {
+        await restorer.restore(inspected);
+      } on BackupReopenException catch (error) {
+        failure = error;
+      }
+
+      expect(failure, isNotNull);
+      expect(failure!.operationError, isA<BackupException>());
+      expect(await Directory(failure.recoveryPath).exists(), isTrue);
+      expect(await Directory(inspected.temporaryDirectory).exists(), isTrue);
+      expect(database.isOpen, isFalse);
+
+      await failure.retryReopen();
+
+      expect(database.isOpen, isTrue);
+      expect(
+        (await database.read((db) => db.query('baby'))).single['name'],
+        '当前数据',
+      );
+      expect(await Directory(failure.recoveryPath).exists(), isFalse);
+      expect(await Directory(inspected.temporaryDirectory).exists(), isFalse);
+    },
+  );
+
+  test(
     'clearAllData commits indexes before cleanup and queues failures',
     () async {
       final media = await _writeSupportFile(
@@ -837,6 +1216,7 @@ void main() {
       await clearAllData(
         database: database,
         mediaService: mediaService,
+        destructiveOperationGate: destructiveOperationGate,
         queueOrphanCleanup: (paths) async {
           final babyRows = await database.read((db) => db.query('baby'));
           final recordRows = await database.read((db) => db.query('records'));
@@ -867,6 +1247,7 @@ void main() {
         await clearAllData(
           database: database,
           mediaService: _ClearMediaService(<String>[]),
+          destructiveOperationGate: destructiveOperationGate,
           queueOrphanCleanup: (_) async {
             throw StateError('queue unavailable');
           },
@@ -880,6 +1261,48 @@ void main() {
       expect(failure.toString(), '数据已清空，但媒体清理排队失败');
       expect(await database.read((db) => db.query('baby')), isEmpty);
       expect(await database.read((db) => db.query('records')), isEmpty);
+    },
+  );
+
+  test(
+    'paused clear cleanup completes before restore installs replacement media',
+    () async {
+      final media = await _writeSupportFile(
+        support,
+        'media/originals/serialized.jpg',
+        [1],
+      );
+      await _seedDatabase(database, babyName: '备份宝宝', originalPath: media.path);
+      final exporter = await createService();
+      final archive = await exporter.exportBackup();
+      await media.writeAsBytes([9], flush: true);
+      final restorer = await createService();
+      final inspected = await restorer.inspect(archive);
+      final cleanup = _PausingRemoveMediaService();
+
+      final clear = clearAllData(
+        database: database,
+        mediaService: cleanup,
+        destructiveOperationGate: destructiveOperationGate,
+        queueOrphanCleanup: (_) async {},
+      );
+      await cleanup.started.future;
+      var restoreCompleted = false;
+      final restore = restorer.restore(inspected).then((_) {
+        restoreCompleted = true;
+      });
+      await Future<void>.delayed(Duration.zero);
+
+      expect(restoreCompleted, isFalse);
+      expect(await media.readAsBytes(), [9]);
+
+      cleanup.release.complete();
+      await clear;
+      await restore;
+
+      expect(await media.readAsBytes(), [1]);
+      final babies = await database.read((db) => db.query('baby'));
+      expect(babies.single['name'], '备份宝宝');
     },
   );
 }
@@ -921,6 +1344,43 @@ class _AfterCallbackLifecycle implements DatabaseLifecycle {
   });
 }
 
+class _ReopenFailureLifecycle implements DatabaseLifecycle {
+  _ReopenFailureLifecycle(this.database, {required this.explicitFailures});
+
+  final AppDatabase database;
+  int explicitFailures;
+
+  @override
+  Future<T> withClosedDatabase<T>(
+    Future<T> Function(String databasePath) work,
+  ) async {
+    Object? operationError;
+    StackTrace? operationStackTrace;
+    try {
+      await database.withClosedDatabase(work);
+    } catch (error, stackTrace) {
+      operationError = error;
+      operationStackTrace = stackTrace;
+    }
+    await database.close();
+    throw DatabaseLifecycleReopenException(
+      operationError: operationError,
+      operationStackTrace: operationStackTrace,
+      reopenError: StateError('automatic reopen failed'),
+      reopenStackTrace: StackTrace.current,
+    );
+  }
+
+  @override
+  Future<void> reopen() async {
+    if (explicitFailures > 0) {
+      explicitFailures -= 1;
+      throw StateError('explicit reopen failed');
+    }
+    await database.reopen();
+  }
+}
+
 class _ClearMediaService implements MediaService {
   _ClearMediaService(this.events);
 
@@ -930,6 +1390,35 @@ class _ClearMediaService implements MediaService {
   Future<void> remove(Iterable<String> paths) async {
     events.add('remove');
     throw StateError('cleanup failed');
+  }
+
+  @override
+  Future<CommittedMedia> commit(StagedMedia staged) =>
+      throw UnimplementedError();
+
+  @override
+  Future<void> removeOrphans(Set<String> referencedPaths) =>
+      throw UnimplementedError();
+
+  @override
+  Future<void> rollback(StagedMedia staged) => throw UnimplementedError();
+
+  @override
+  Future<StagedMedia> stage(PickedMedia input) => throw UnimplementedError();
+}
+
+class _PausingRemoveMediaService implements MediaService {
+  final started = Completer<void>();
+  final release = Completer<void>();
+
+  @override
+  Future<void> remove(Iterable<String> paths) async {
+    started.complete();
+    await release.future;
+    for (final path in paths) {
+      final file = File(path);
+      if (await file.exists()) await file.delete();
+    }
   }
 
   @override
@@ -1088,6 +1577,34 @@ Future<void> _renameEntity(String source, String destination) async {
   } else {
     throw FileSystemException('Missing rename source', source);
   }
+}
+
+Future<String> _createMutatedArchive(
+  Directory root,
+  DatabaseFactory factory,
+  String name,
+  void Function(Uint8List bytes, int centralOffset, int localOffset) mutate,
+) async {
+  final archive = await _createArchiveFixture(
+    root,
+    factory,
+    fileName: '$name.babygrowth.zip',
+  );
+  final bytes = await File(archive).readAsBytes();
+  final data = ByteData.sublistView(bytes);
+  var eocd = -1;
+  for (var offset = bytes.length - 4; offset >= 0; offset -= 1) {
+    if (data.getUint32(offset, Endian.little) == 0x06054b50) {
+      eocd = offset;
+      break;
+    }
+  }
+  if (eocd < 0) throw StateError('fixture EOCD missing');
+  final central = data.getUint32(eocd + 16, Endian.little);
+  final local = data.getUint32(central + 42, Endian.little);
+  mutate(bytes, central, local);
+  await File(archive).writeAsBytes(bytes, flush: true);
+  return archive;
 }
 
 Uint8List _zipEndRecords({

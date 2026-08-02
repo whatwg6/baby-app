@@ -1,9 +1,12 @@
+import 'dart:async';
+
 import 'package:baby_growth_timeline/data/repositories/baby_repository.dart';
 import 'package:baby_growth_timeline/data/repositories/record_repository.dart';
 import 'package:baby_growth_timeline/domain/models/attachment.dart';
 import 'package:baby_growth_timeline/domain/models/baby.dart';
 import 'package:baby_growth_timeline/domain/models/record_draft.dart';
 import 'package:baby_growth_timeline/domain/models/timeline_record.dart';
+import 'package:baby_growth_timeline/domain/destructive_operation_gate.dart';
 import 'package:baby_growth_timeline/features/baby/application/baby_controller.dart';
 import 'package:baby_growth_timeline/features/baby/presentation/baby_page.dart';
 import 'package:baby_growth_timeline/features/backup/presentation/backup_actions.dart';
@@ -28,6 +31,7 @@ void main() {
     required _RecordingMediaService mediaService,
     Future<void> Function(Set<String>)? queueOrphanCleanup,
     Future<void> Function()? onDeleted,
+    DestructiveOperationGate? destructiveOperationGate,
   }) => tester.pumpWidget(
     MaterialApp(
       home: Scaffold(
@@ -35,6 +39,8 @@ void main() {
           recordId: 'record-1',
           repository: repository,
           mediaService: mediaService,
+          destructiveOperationGate:
+              destructiveOperationGate ?? SerialDestructiveOperationGate(),
           queueOrphanCleanup: queueOrphanCleanup ?? (_) async {},
           onDeleted: onDeleted,
         ),
@@ -81,6 +87,35 @@ void main() {
       'database committed',
       'remove:/private/media/original.jpg,/private/media/thumbnail.jpg',
       'notified',
+    ]);
+  });
+
+  testWidgets('delete waits for the shared destructive operation gate', (
+    tester,
+  ) async {
+    final events = <String>[];
+    final gate = _BlockingDestructiveOperationGate();
+    await pumpDelete(
+      tester,
+      repository: _DeleteRepository(attachment, events),
+      mediaService: _RecordingMediaService(events),
+      destructiveOperationGate: gate,
+    );
+
+    await tester.tap(find.text('删除'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilledButton, '删除'));
+    await tester.pump();
+    await gate.started.future;
+
+    expect(events, isEmpty);
+
+    gate.release.complete();
+    await tester.pumpAndSettle();
+
+    expect(events, [
+      'database committed',
+      'remove:/private/media/original.jpg,/private/media/thumbnail.jpg',
     ]);
   });
 
@@ -270,4 +305,16 @@ class _BabyRepository implements BabyRepository {
 
   @override
   Future<Baby> update(String id, BabyDraft draft) => throw UnimplementedError();
+}
+
+class _BlockingDestructiveOperationGate implements DestructiveOperationGate {
+  final started = Completer<void>();
+  final release = Completer<void>();
+
+  @override
+  Future<T> run<T>(Future<T> Function() operation) async {
+    started.complete();
+    await release.future;
+    return operation();
+  }
 }

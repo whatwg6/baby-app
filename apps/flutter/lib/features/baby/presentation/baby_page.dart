@@ -1,14 +1,23 @@
 import 'package:flutter/material.dart';
 
+import '../../backup/domain/backup_service.dart';
 import '../../backup/presentation/backup_actions.dart';
 import '../application/baby_controller.dart';
 import 'baby_form.dart';
 import 'baby_header.dart';
 
 class BabyPage extends StatefulWidget {
-  const BabyPage({super.key, this.controller, this.onClearAllData});
+  const BabyPage({
+    super.key,
+    this.controller,
+    this.backupService,
+    this.onBackupRestored,
+    this.onClearAllData,
+  });
 
   final BabyController? controller;
+  final BackupService? backupService;
+  final Future<void> Function()? onBackupRestored;
   final Future<void> Function()? onClearAllData;
 
   @override
@@ -85,6 +94,13 @@ class _BabyPageState extends State<BabyPage> {
                   ],
                 ],
               ),
+            if (widget.backupService != null) ...[
+              const SizedBox(height: 24),
+              BackupActions(
+                service: widget.backupService!,
+                onRestored: widget.onBackupRestored,
+              ),
+            ],
           ],
         ),
       ),

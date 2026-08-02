@@ -3,6 +3,7 @@ import 'package:go_router/go_router.dart';
 
 import '../../../domain/date/timeline_grouping.dart';
 import '../../../domain/models/baby.dart';
+import '../../baby/application/baby_controller.dart';
 import '../application/timeline_controller.dart';
 import '../../baby/presentation/baby_header.dart';
 import 'timeline_filters.dart';
@@ -13,12 +14,14 @@ class TimelinePage extends StatefulWidget {
     super.key,
     required this.hasBaby,
     this.controller,
+    this.babyController,
     this.baby,
     this.now,
   });
 
   final bool hasBaby;
   final TimelineController? controller;
+  final BabyController? babyController;
   final Baby? baby;
   final DateTime Function()? now;
 
@@ -38,11 +41,11 @@ class _TimelinePageState extends State<TimelinePage> {
     final controller = widget.controller;
     if (controller == null) return _EmptyTimeline(hasBaby: widget.hasBaby);
     return AnimatedBuilder(
-      animation: controller,
+      animation: Listenable.merge([controller, ?widget.babyController]),
       builder: (context, _) => _TimelineContent(
         controller: controller,
         hasBaby: widget.hasBaby,
-        baby: widget.baby,
+        baby: widget.babyController?.baby ?? widget.baby,
         now: widget.now ?? DateTime.now,
       ),
     );

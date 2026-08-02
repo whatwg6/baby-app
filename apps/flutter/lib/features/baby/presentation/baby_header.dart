@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 
 import '../../../domain/date/age_label.dart';
+import '../../../domain/models/attachment.dart';
 import '../../../domain/models/baby.dart';
+import '../../media/presentation/media_preview.dart';
 
 class BabyHeader extends StatelessWidget {
   const BabyHeader({super.key, required this.baby, this.now});
@@ -16,7 +18,18 @@ class BabyHeader extends StatelessWidget {
 
     return Row(
       children: [
-        const CircleAvatar(child: Icon(Icons.child_care)),
+        if (baby.avatarPath case final avatarPath?)
+          MediaPreview(
+            filePath: avatarPath,
+            mediaType: MediaType.image,
+            width: 48,
+            height: 48,
+            borderRadius: BorderRadius.circular(24),
+            unavailableBuilder: (_) =>
+                const CircleAvatar(child: Icon(Icons.child_care)),
+          )
+        else
+          const CircleAvatar(child: Icon(Icons.child_care)),
         const SizedBox(width: 12),
         Column(
           crossAxisAlignment: CrossAxisAlignment.start,

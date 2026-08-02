@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../media/presentation/media_preview.dart';
 import '../../../domain/models/timeline_record.dart';
 
 class TimelineCard extends StatelessWidget {
@@ -32,24 +33,39 @@ class _MomentCard extends StatelessWidget {
   final TimelineRecord record;
 
   @override
-  Widget build(BuildContext context) => Column(
-    crossAxisAlignment: CrossAxisAlignment.start,
-    children: [
-      const DecoratedBox(
-        decoration: BoxDecoration(color: Color(0xFFF8E4D9)),
-        child: SizedBox(
-          height: 132,
-          width: double.infinity,
-          child: Icon(Icons.photo_camera_outlined, size: 40),
+  Widget build(BuildContext context) {
+    final attachment = record.attachments.isEmpty
+        ? null
+        : record.attachments.first;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (attachment == null)
+          const DecoratedBox(
+            decoration: BoxDecoration(color: Color(0xFFF8E4D9)),
+            child: SizedBox(
+              height: 132,
+              width: double.infinity,
+              child: Icon(Icons.photo_camera_outlined, size: 40),
+            ),
+          )
+        else
+          MediaPreview(
+            filePath: attachment.filePath,
+            thumbnailPath: attachment.thumbnailPath,
+            mediaType: attachment.mediaType,
+            width: double.infinity,
+            height: 132,
+            borderRadius: BorderRadius.zero,
+          ),
+        const SizedBox(height: 12),
+        _RecordHeading(
+          record: record,
+          title: record.note?.trim().isNotEmpty == true ? record.note! : '珍贵时刻',
         ),
-      ),
-      const SizedBox(height: 12),
-      _RecordHeading(
-        record: record,
-        title: record.note?.trim().isNotEmpty == true ? record.note! : '珍贵时刻',
-      ),
-    ],
-  );
+      ],
+    );
+  }
 }
 
 class _CompactCard extends StatelessWidget {

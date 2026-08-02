@@ -341,10 +341,11 @@ void main() {
   testWidgets('editing completely prefills fields and existing attachments', (
     tester,
   ) async {
+    final localOccurredAt = DateTime(2026, 7, 31, 21, 15);
     final existing = TimelineRecord(
       id: 'activity-1',
       type: RecordType.activity,
-      occurredAt: DateTime.utc(2026, 7, 31, 21, 15),
+      occurredAt: localOccurredAt.toUtc(),
       note: '睡前奶',
       details: const RecordDetails.activity(
         activityType: ActivityType.feeding,
@@ -384,7 +385,7 @@ void main() {
           .widget<TextFormField>(find.byKey(const Key('occurred-at')))
           .controller!
           .text,
-      '2026-08-01 05:15',
+      '2026-07-31 21:15',
     );
     expect(
       tester
